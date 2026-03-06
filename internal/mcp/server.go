@@ -208,6 +208,8 @@ func registerGetSymbolContextTool(srv *server.MCPServer, st *store.Store) {
 		mcp.WithDescription("Return symbol context with incoming references (best effort)"),
 		mcp.WithString("project", mcp.Required(), mcp.Description("Project name or root path")),
 		mcp.WithString("symbol", mcp.Required(), mcp.Description("Symbol or fully-qualified name")),
+		mcp.WithString("filePath", mcp.Description("Optional file path filter for disambiguation")),
+		mcp.WithNumber("limit", mcp.Description("Maximum symbols to return (default 20)")),
 	)
 	srv.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		projectArg, err := req.RequireString("project")
@@ -224,7 +226,9 @@ func registerGetSymbolContextTool(srv *server.MCPServer, st *store.Store) {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		symbols, err := st.FindSymbols(ctx, project.ID, symbol, 20)
+		filePath := req.GetString("filePath", "")
+		limit := req.GetInt("limit", 20)
+		symbols, err := st.FindSymbolsWithFilter(ctx, project.ID, symbol, filePath, limit)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("find symbols: %v", err)), nil
 		}
@@ -232,6 +236,7 @@ func registerGetSymbolContextTool(srv *server.MCPServer, st *store.Store) {
 		type symbolContext struct {
 			Symbol   store.Symbol            `json:"symbol"`
 			Incoming []store.SymbolReference `json:"incoming"`
+			Outgoing []store.SymbolReference `json:"outgoing"`
 		}
 		contexts := make([]symbolContext, 0, len(symbols))
 		for _, sym := range symbols {
@@ -239,15 +244,23 @@ func registerGetSymbolContextTool(srv *server.MCPServer, st *store.Store) {
 			if incomingErr != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("load incoming references for %s: %v", sym.Name, incomingErr)), nil
 			}
-			contexts = append(contexts, symbolContext{Symbol: sym, Incoming: incoming})
+			outgoing, outgoingErr := st.ListOutgoingReferences(ctx, project.ID, sym, 100)
+			if outgoingErr != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("load outgoing references for %s: %v", sym.Name, outgoingErr)), nil
+			}
+			contexts = append(contexts, symbolContext{Symbol: sym, Incoming: incoming, Outgoing: outgoing})
 		}
 
+		disambiguationNeeded := len(contexts) > 1
+
 		payload := map[string]any{
-			"project":  project,
-			"query":    symbol,
-			"count":    len(contexts),
-			"contexts": contexts,
-			"note":     "incoming references currently focus on imports and lightweight parser signals",
+			"project":              project,
+			"query":                symbol,
+			"count":                len(contexts),
+			"filePathFilter":       filePath,
+			"disambiguationNeeded": disambiguationNeeded,
+			"contexts":             contexts,
+			"note":                 "references are heuristic and currently include imports plus lightweight call detection",
 		}
 		return jsonToolResult(payload)
 	})

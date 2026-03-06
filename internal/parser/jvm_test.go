@@ -9,7 +9,7 @@ package com.example.demo
 import org.springframework.web.reactive.function.client.WebClient
 
 class BotService {
-    fun sendMessage(text: String) {}
+    fun sendMessage(text: String) { println(text) }
 }
 `)
 
@@ -17,11 +17,28 @@ class BotService {
 	if len(symbols) < 2 {
 		t.Fatalf("expected at least 2 symbols, got %d", len(symbols))
 	}
-	if len(refs) != 1 {
-		t.Fatalf("expected 1 import reference, got %d", len(refs))
+	if len(refs) < 2 {
+		t.Fatalf("expected at least 2 references (import + call), got %d", len(refs))
 	}
-	if refs[0].ToFQName != "org.springframework.web.reactive.function.client.WebClient" {
-		t.Fatalf("unexpected import fq name: %s", refs[0].ToFQName)
+	foundImport := false
+	for _, ref := range refs {
+		if ref.RefType == "IMPORTS" && ref.ToFQName == "org.springframework.web.reactive.function.client.WebClient" {
+			foundImport = true
+			break
+		}
+	}
+	if !foundImport {
+		t.Fatalf("expected import reference to WebClient, refs=%#v", refs)
+	}
+	foundCall := false
+	for _, ref := range refs {
+		if ref.RefType == "CALLS" && ref.ToName == "println" {
+			foundCall = true
+			break
+		}
+	}
+	if !foundCall {
+		t.Fatalf("expected CALLS reference to println, refs=%#v", refs)
 	}
 }
 
@@ -43,7 +60,14 @@ public class Greeter {
 	if len(refs) != 1 {
 		t.Fatalf("expected 1 import reference, got %d", len(refs))
 	}
-	if refs[0].ToFQName != "java.util.List" {
-		t.Fatalf("unexpected import fq name: %s", refs[0].ToFQName)
+	foundImport := false
+	for _, ref := range refs {
+		if ref.RefType == "IMPORTS" && ref.ToFQName == "java.util.List" {
+			foundImport = true
+			break
+		}
+	}
+	if !foundImport {
+		t.Fatalf("expected import reference to java.util.List, refs=%#v", refs)
 	}
 }

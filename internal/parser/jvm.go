@@ -39,6 +39,8 @@ var (
 
 	ktTypeRE = regexp.MustCompile(`\b(class|interface|object|enum\s+class|data\s+class|sealed\s+class)\s+([A-Za-z_][A-Za-z0-9_]*)`)
 	ktFunRE  = regexp.MustCompile(`\bfun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+
+	callExprRE = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
 )
 
 func ParseFile(path string, content []byte) ([]Symbol, []Reference) {
@@ -53,6 +55,8 @@ func ParseFile(path string, content []byte) ([]Symbol, []Reference) {
 
 	symbols := make([]Symbol, 0, 16)
 	refs := make([]Reference, 0, 32)
+	callRefs := make([]Reference, 0, 64)
+	lastCallableByLine := map[int]string{}
 
 	for i, line := range lines {
 		lineNo := i + 1
@@ -70,10 +74,24 @@ func ParseFile(path string, content []byte) ([]Symbol, []Reference) {
 		}
 
 		symbols = append(symbols, parseTypeSymbol(line, language, packageName, path, lineNo)...)
-		symbols = append(symbols, parseFunctionSymbol(line, language, packageName, path, lineNo)...)
+		fnSymbols := parseFunctionSymbol(line, language, packageName, path, lineNo)
+		symbols = append(symbols, fnSymbols...)
+		if len(fnSymbols) > 0 {
+			lastCallableByLine[lineNo] = fnSymbols[0].Name
+		}
 	}
 
-	return dedupeSymbols(symbols), refs
+	currentOwner := baseName
+	for i, line := range lines {
+		lineNo := i + 1
+		if owner, ok := lastCallableByLine[lineNo]; ok {
+			currentOwner = owner
+		}
+		callRefs = append(callRefs, parseCallReferences(path, line, currentOwner)...)
+	}
+	refs = append(refs, callRefs...)
+
+	return dedupeSymbols(symbols), dedupeReferences(refs)
 }
 
 func parsePackage(lines []string, language string) string {
@@ -145,6 +163,41 @@ func parseFunctionSymbol(line, language, pkg, filePath string, lineNo int) []Sym
 	return nil
 }
 
+func parseCallReferences(filePath, line, owner string) []Reference {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "import ") {
+		return nil
+	}
+
+	matches := callExprRE.FindAllStringSubmatch(line, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	refs := make([]Reference, 0, len(matches))
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		target := strings.TrimSpace(match[1])
+		if isCallKeyword(target) {
+			continue
+		}
+		if looksLikeDeclaration(line, target) {
+			continue
+		}
+		refs = append(refs, Reference{
+			FromName:   owner,
+			FromFile:   filePath,
+			ToName:     target,
+			RefType:    "CALLS",
+			Confidence: 0.7,
+			Evidence:   trimmed,
+		})
+	}
+	return refs
+}
+
 func makeSymbol(name, pkg, kind, language, filePath string, lineNo int, signature string) Symbol {
 	fq := name
 	if pkg != "" {
@@ -200,4 +253,41 @@ func dedupeSymbols(symbols []Symbol) []Symbol {
 		out = append(out, s)
 	}
 	return out
+}
+
+func dedupeReferences(refs []Reference) []Reference {
+	seen := map[string]struct{}{}
+	out := make([]Reference, 0, len(refs))
+	for _, ref := range refs {
+		key := strings.Join([]string{ref.FromFile, ref.FromName, ref.ToName, ref.ToFQName, ref.RefType, ref.Evidence}, "|")
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, ref)
+	}
+	return out
+}
+
+func isCallKeyword(name string) bool {
+	switch name {
+	case "if", "for", "while", "switch", "catch", "when", "try", "return", "throw", "new", "super", "this", "class", "fun":
+		return true
+	default:
+		return false
+	}
+}
+
+func looksLikeDeclaration(line, candidate string) bool {
+	trimmed := strings.TrimSpace(line)
+	if strings.Contains(trimmed, "class "+candidate) || strings.Contains(trimmed, "interface "+candidate) || strings.Contains(trimmed, "record "+candidate) || strings.Contains(trimmed, "enum "+candidate) {
+		return true
+	}
+	if strings.Contains(trimmed, "fun "+candidate+"(") {
+		return true
+	}
+	if strings.Contains(trimmed, " "+candidate+"(") && (strings.Contains(trimmed, "public ") || strings.Contains(trimmed, "private ") || strings.Contains(trimmed, "protected ") || strings.Contains(trimmed, "static ")) {
+		return true
+	}
+	return false
 }

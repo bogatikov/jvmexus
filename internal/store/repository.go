@@ -343,16 +343,37 @@ func (s *Store) ReplaceSymbolReferences(ctx context.Context, projectID int64, re
 }
 
 func (s *Store) FindSymbols(ctx context.Context, projectID int64, symbolQuery string, limit int) ([]Symbol, error) {
+	return s.FindSymbolsWithFilter(ctx, projectID, symbolQuery, "", limit)
+}
+
+func (s *Store) FindSymbolsWithFilter(ctx context.Context, projectID int64, symbolQuery, filePath string, limit int) ([]Symbol, error) {
 	if limit <= 0 {
 		limit = 20
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	query := `
 		SELECT id, file_path, language, name, fq_name, kind, start_line, end_line, ifnull(signature,'')
 		FROM symbols
-		WHERE project_id = ? AND (name = ? OR fq_name = ? OR name LIKE ? OR fq_name LIKE ?)
-		ORDER BY CASE WHEN name = ? OR fq_name = ? THEN 0 ELSE 1 END, name ASC
-		LIMIT ?
-	`, projectID, symbolQuery, symbolQuery, symbolQuery+"%", symbolQuery+"%", symbolQuery, symbolQuery, limit)
+		WHERE project_id = ? AND (name = ? OR fq_name = ? OR name LIKE ? OR fq_name LIKE ? OR name LIKE ? OR fq_name LIKE ?)`
+	args := []any{projectID, symbolQuery, symbolQuery, symbolQuery + "%", symbolQuery + "%", "%" + symbolQuery + "%", "%" + symbolQuery + "%"}
+	if filePath != "" {
+		query += ` AND file_path LIKE ?`
+		args = append(args, "%"+filePath+"%")
+	}
+	query += `
+		ORDER BY
+		CASE
+		  WHEN fq_name = ? THEN 0
+		  WHEN name = ? THEN 1
+		  WHEN fq_name LIKE ? THEN 2
+		  WHEN name LIKE ? THEN 3
+		  ELSE 4
+		END,
+		CASE WHEN kind IN ('Type','Interface') THEN 0 ELSE 1 END,
+		name ASC
+		LIMIT ?`
+	args = append(args, symbolQuery, symbolQuery, symbolQuery+"%", symbolQuery+"%", limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query symbols: %w", err)
 	}
@@ -370,6 +391,36 @@ func (s *Store) FindSymbols(ctx context.Context, projectID int64, symbolQuery st
 		return nil, fmt.Errorf("iterate symbols: %w", err)
 	}
 	return result, nil
+}
+
+func (s *Store) ListOutgoingReferences(ctx context.Context, projectID int64, symbol Symbol, limit int) ([]SymbolReference, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT from_name, from_file_path, to_name, ifnull(to_fq_name,''), ref_type, confidence, ifnull(evidence,'')
+		FROM symbol_refs
+		WHERE project_id = ? AND (from_name = ? OR from_file_path = ?)
+		ORDER BY ref_type ASC, confidence DESC, to_name ASC
+		LIMIT ?
+	`, projectID, symbol.Name, symbol.FilePath, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query outgoing refs: %w", err)
+	}
+	defer rows.Close()
+
+	refs := make([]SymbolReference, 0, limit)
+	for rows.Next() {
+		var ref SymbolReference
+		if err := rows.Scan(&ref.FromName, &ref.FromFile, &ref.ToName, &ref.ToFQName, &ref.RefType, &ref.Confidence, &ref.Evidence); err != nil {
+			return nil, fmt.Errorf("scan outgoing ref: %w", err)
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate outgoing refs: %w", err)
+	}
+	return refs, nil
 }
 
 func (s *Store) ListIncomingReferences(ctx context.Context, projectID int64, symbol Symbol, limit int) ([]SymbolReference, error) {
