@@ -27,10 +27,12 @@ type Dependency struct {
 	Version        string  `json:"version,omitempty"`
 	Scope          string  `json:"scope"`
 	Type           string  `json:"type"`
+	Kind           string  `json:"kind"`
 	BinaryJarPath  string  `json:"binaryJarPath,omitempty"`
 	SourceJarPath  string  `json:"sourceJarPath,omitempty"`
 	SourceStatus   string  `json:"sourceStatus"`
 	ResolutionType string  `json:"resolutionType"`
+	MetadataJSON   string  `json:"metadataJson,omitempty"`
 	Confidence     float64 `json:"confidence"`
 }
 
@@ -99,9 +101,9 @@ func (s *Store) ReplaceDependencies(ctx context.Context, projectID int64, depend
 
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO dependencies(
-			project_id, module_name, group_id, artifact_id, version, scope, dep_type,
-			binary_jar_path, source_jar_path, source_status, resolution_type, confidence
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			project_id, module_name, group_id, artifact_id, version, scope, dep_type, dep_kind,
+			binary_jar_path, source_jar_path, source_status, resolution_type, metadata_json, confidence
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare insert dep: %w", err)
@@ -117,10 +119,12 @@ func (s *Store) ReplaceDependencies(ctx context.Context, projectID int64, depend
 			dep.Version,
 			dep.Scope,
 			dep.Type,
+			dep.Kind,
 			nullable(dep.BinaryJarPath),
 			nullable(dep.SourceJarPath),
 			dep.SourceStatus,
 			dep.ResolutionType,
+			nullable(dep.MetadataJSON),
 			dep.Confidence,
 		); err != nil {
 			return fmt.Errorf("insert dep %s:%s: %w", dep.GroupID, dep.ArtifactID, err)
@@ -177,13 +181,22 @@ func (s *Store) FindProject(ctx context.Context, nameOrPath string) (Project, er
 }
 
 func (s *Store) ListDependenciesByProjectID(ctx context.Context, projectID int64) ([]Dependency, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT module_name, group_id, artifact_id, ifnull(version,''), scope, dep_type,
-		       ifnull(binary_jar_path,''), ifnull(source_jar_path,''), source_status, resolution_type, confidence
+	return s.ListDependenciesByProjectIDWithMode(ctx, projectID, false)
+}
+
+func (s *Store) ListDependenciesByProjectIDWithMode(ctx context.Context, projectID int64, includeTransitive bool) ([]Dependency, error) {
+	query := `
+		SELECT module_name, group_id, artifact_id, ifnull(version,''), scope, dep_type, ifnull(dep_kind,'direct'),
+		       ifnull(binary_jar_path,''), ifnull(source_jar_path,''), source_status, resolution_type, ifnull(metadata_json,''), confidence
 		FROM dependencies
-		WHERE project_id = ?
-		ORDER BY module_name ASC, group_id ASC, artifact_id ASC, ifnull(version,'') ASC
-	`, projectID)
+		WHERE project_id = ?`
+	args := []any{projectID}
+	if !includeTransitive {
+		query += ` AND ifnull(dep_kind,'direct') = 'direct'`
+	}
+	query += ` ORDER BY module_name ASC, scope ASC, group_id ASC, artifact_id ASC, ifnull(version,'') ASC`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query dependencies: %w", err)
 	}
@@ -199,10 +212,12 @@ func (s *Store) ListDependenciesByProjectID(ctx context.Context, projectID int64
 			&dep.Version,
 			&dep.Scope,
 			&dep.Type,
+			&dep.Kind,
 			&dep.BinaryJarPath,
 			&dep.SourceJarPath,
 			&dep.SourceStatus,
 			&dep.ResolutionType,
+			&dep.MetadataJSON,
 			&dep.Confidence,
 		); err != nil {
 			return nil, fmt.Errorf("scan dependency: %w", err)

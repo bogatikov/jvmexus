@@ -62,20 +62,26 @@ func (s *Service) IndexProject(ctx context.Context, path string, _ Options) (Res
 		return Result{}, fmt.Errorf("extract dependencies: %w", err)
 	}
 
-	deps, resolveWarnings := gradle.EnrichResolvedDependencies(ctx, absRoot, modules, deps, gradle.ResolveOptions{
+	deps, transitiveDeps, resolveWarnings := gradle.EnrichResolvedDependencies(ctx, absRoot, modules, deps, gradle.ResolveOptions{
 		GradleTimeoutSec: s.cfg.GradleTimeoutSeconds,
 		Offline:          s.cfg.Offline,
 	})
 
-	enrichedDeps, sourceWarnings := gradle.AttachSourceJars(ctx, deps, gradle.SourceOptions{
+	enrichedDirectDeps, sourceWarnings := gradle.AttachSourceJars(ctx, deps, gradle.SourceOptions{
 		FetchMissingSources: s.cfg.FetchMissingSources,
 		Offline:             s.cfg.Offline,
 		DownloadTimeoutSec:  s.cfg.SourcesDownloadTimeout,
 		ExtraSourceDir:      filepath.Join(absRoot, ".jvmexus", "sources"),
 	})
 
-	storeDeps := make([]store.Dependency, 0, len(enrichedDeps))
-	for _, dep := range enrichedDeps {
+	allDeps := append(enrichedDirectDeps, transitiveDeps...)
+
+	storeDeps := make([]store.Dependency, 0, len(allDeps))
+	for _, dep := range allDeps {
+		kind := dep.Kind
+		if kind == "" {
+			kind = gradle.DependencyKindDirect
+		}
 		storeDeps = append(storeDeps, store.Dependency{
 			ModuleName:     dep.ModuleName,
 			GroupID:        dep.GroupID,
@@ -83,10 +89,12 @@ func (s *Service) IndexProject(ctx context.Context, path string, _ Options) (Res
 			Version:        dep.Version,
 			Scope:          dep.Scope,
 			Type:           dep.Type,
+			Kind:           kind,
 			BinaryJarPath:  dep.BinaryJarPath,
 			SourceJarPath:  dep.SourceJarPath,
 			SourceStatus:   dep.SourceStatus,
 			ResolutionType: dep.ResolutionType,
+			MetadataJSON:   dep.MetadataJSON,
 			Confidence:     dep.Confidence,
 		})
 	}

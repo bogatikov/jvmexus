@@ -184,8 +184,10 @@ func parseDependencyNoParenNoVersionMatch(moduleName string, match []string) (De
 
 func buildDependency(moduleName, scope, groupID, artifactID, version string, isPlatform bool) Dependency {
 	depType := "external"
+	metadataJSON := ""
 	if isPlatform {
 		depType = "platform"
+		metadataJSON = `{"platform":true}`
 	}
 
 	status := SourceStatusNotFound
@@ -203,8 +205,10 @@ func buildDependency(moduleName, scope, groupID, artifactID, version string, isP
 		Version:        version,
 		Scope:          scope,
 		Type:           depType,
+		Kind:           DependencyKindDirect,
 		SourceStatus:   status,
 		ResolutionType: resolutionType,
+		MetadataJSON:   metadataJSON,
 		Confidence:     confidence,
 	}
 }

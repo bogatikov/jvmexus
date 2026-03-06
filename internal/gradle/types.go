@@ -9,6 +9,9 @@ const (
 
 	ResolutionTypeDeclared = "declared"
 	ResolutionTypeResolved = "resolved"
+
+	DependencyKindDirect     = "direct"
+	DependencyKindTransitive = "transitive"
 )
 
 type Module struct {
@@ -23,10 +26,12 @@ type Dependency struct {
 	Version        string
 	Scope          string
 	Type           string
+	Kind           string
 	BinaryJarPath  string
 	SourceJarPath  string
 	SourceStatus   string
 	ResolutionType string
+	MetadataJSON   string
 	Confidence     float64
 }
 

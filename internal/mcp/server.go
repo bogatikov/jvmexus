@@ -73,7 +73,7 @@ func registerResources(srv *server.MCPServer, st *store.Store) {
 		if err != nil {
 			return nil, err
 		}
-		dependencies, err := st.ListDependenciesByProjectID(ctx, project.ID)
+		dependencies, err := st.ListDependenciesByProjectIDWithMode(ctx, project.ID, false)
 		if err != nil {
 			return nil, err
 		}
@@ -113,7 +113,7 @@ func registerResources(srv *server.MCPServer, st *store.Store) {
 		if err != nil {
 			return nil, err
 		}
-		dependencies, err := st.ListDependenciesByProjectID(ctx, project.ID)
+		dependencies, err := st.ListDependenciesByProjectIDWithMode(ctx, project.ID, false)
 		if err != nil {
 			return nil, err
 		}
@@ -278,6 +278,7 @@ func registerGetDependenciesTool(srv *server.MCPServer, st *store.Store) {
 		"get_dependencies",
 		mcp.WithDescription("Return project dependencies with source attachment metadata"),
 		mcp.WithString("project", mcp.Required(), mcp.Description("Project name or root path")),
+		mcp.WithBoolean("includeTransitive", mcp.Description("Include transitive dependencies in addition to direct ones")),
 	)
 
 	srv.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -291,7 +292,9 @@ func registerGetDependenciesTool(srv *server.MCPServer, st *store.Store) {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		dependencies, err := st.ListDependenciesByProjectID(ctx, project.ID)
+		includeTransitive := req.GetBool("includeTransitive", false)
+
+		dependencies, err := st.ListDependenciesByProjectIDWithMode(ctx, project.ID, includeTransitive)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("load dependencies: %v", err)), nil
 		}
@@ -302,10 +305,11 @@ func registerGetDependenciesTool(srv *server.MCPServer, st *store.Store) {
 		}
 
 		payload := map[string]any{
-			"project":      project,
-			"total":        len(dependencies),
-			"sourceStats":  stats,
-			"dependencies": dependencies,
+			"project":           project,
+			"total":             len(dependencies),
+			"includeTransitive": includeTransitive,
+			"sourceStats":       stats,
+			"dependencies":      dependencies,
 		}
 		return jsonToolResult(payload)
 	})

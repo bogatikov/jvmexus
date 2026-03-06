@@ -18,10 +18,18 @@ type ResolveOptions struct {
 }
 
 var resolvedDepLineRE = regexp.MustCompile(`(?m)([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):([^\s\(]+)(?:\s+->\s+([^\s\(]+))?`)
+var treeEntryRE = regexp.MustCompile(`([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):([^\s\(]+)(?:\s+->\s+([^\s\(]+))?`)
 
-func EnrichResolvedDependencies(ctx context.Context, repoRoot string, modules []Module, declared []Dependency, opts ResolveOptions) ([]Dependency, []string) {
+type resolvedEntry struct {
+	GroupID    string
+	ArtifactID string
+	Version    string
+	Depth      int
+}
+
+func EnrichResolvedDependencies(ctx context.Context, repoRoot string, modules []Module, declared []Dependency, opts ResolveOptions) ([]Dependency, []Dependency, []string) {
 	if opts.Offline {
-		return declared, []string{"offline mode enabled; skipping Gradle resolved dependency enrichment"}
+		return declared, nil, []string{"offline mode enabled; skipping Gradle resolved dependency enrichment"}
 	}
 	if opts.GradleTimeoutSec <= 0 {
 		opts.GradleTimeoutSec = 120
@@ -29,12 +37,18 @@ func EnrichResolvedDependencies(ctx context.Context, repoRoot string, modules []
 
 	gradlewPath := filepath.Join(repoRoot, "gradlew")
 	if _, err := os.Stat(gradlewPath); err != nil {
-		return declared, []string{"gradlew not found; using declared dependencies only"}
+		return declared, nil, []string{"gradlew not found; using declared dependencies only"}
 	}
 
 	resolved := make(map[string]string)
+	transitive := make(map[string]Dependency)
+	directIndex := make(map[string]struct{}, len(declared))
 	var warnings []string
 	configs := []string{"runtimeClasspath", "compileClasspath", "testRuntimeClasspath", "testCompileClasspath"}
+
+	for _, dep := range declared {
+		directIndex[dep.ModuleName+"|"+dep.GroupID+":"+dep.ArtifactID] = struct{}{}
+	}
 
 	for _, module := range modules {
 		task := "dependencies"
@@ -53,6 +67,34 @@ func EnrichResolvedDependencies(ctx context.Context, repoRoot string, modules []
 				key := module.Name + "|" + ga
 				if _, exists := resolved[key]; !exists {
 					resolved[key] = version
+				}
+			}
+
+			entries := parseResolvedTreeEntries(stdout)
+			for _, entry := range entries {
+				if entry.Depth <= 0 {
+					continue
+				}
+				ga := entry.GroupID + ":" + entry.ArtifactID
+				directKey := module.Name + "|" + ga
+				if _, isDirect := directIndex[directKey]; isDirect {
+					continue
+				}
+				depKey := strings.Join([]string{module.Name, configName, entry.GroupID, entry.ArtifactID, entry.Version}, "|")
+				if _, exists := transitive[depKey]; exists {
+					continue
+				}
+				transitive[depKey] = Dependency{
+					ModuleName:     module.Name,
+					GroupID:        entry.GroupID,
+					ArtifactID:     entry.ArtifactID,
+					Version:        entry.Version,
+					Scope:          configName,
+					Type:           "external",
+					Kind:           DependencyKindTransitive,
+					SourceStatus:   SourceStatusNotFound,
+					ResolutionType: ResolutionTypeResolved,
+					Confidence:     0.8,
 				}
 			}
 		}
@@ -76,7 +118,12 @@ func EnrichResolvedDependencies(ctx context.Context, repoRoot string, modules []
 		updated = append(updated, dep)
 	}
 
-	return updated, dedupeWarnings(warnings)
+	transitiveList := make([]Dependency, 0, len(transitive))
+	for _, dep := range transitive {
+		transitiveList = append(transitiveList, dep)
+	}
+
+	return updated, transitiveList, dedupeWarnings(warnings)
 }
 
 func runGradleDependencies(ctx context.Context, repoRoot, task, configuration string, timeoutSec int) (string, string, error) {
@@ -121,6 +168,41 @@ func parseResolvedVersionMap(output string) map[string]string {
 		result[groupID+":"+artifactID] = version
 	}
 	return result
+}
+
+func parseResolvedTreeEntries(output string) []resolvedEntry {
+	lines := strings.Split(output, "\n")
+	out := make([]resolvedEntry, 0, 128)
+	for _, line := range lines {
+		idx := strings.Index(line, "---")
+		if idx < 0 {
+			continue
+		}
+		match := treeEntryRE.FindStringSubmatch(line)
+		if len(match) < 4 {
+			continue
+		}
+		version := strings.TrimSpace(match[3])
+		if len(match) > 4 {
+			redirect := strings.TrimSpace(match[4])
+			if redirect != "" {
+				version = redirect
+			}
+		}
+		if version == "" {
+			continue
+		}
+
+		prefix := line[:idx]
+		depth := strings.Count(prefix, "|    ") + strings.Count(prefix, "     ")
+		out = append(out, resolvedEntry{
+			GroupID:    strings.TrimSpace(match[1]),
+			ArtifactID: strings.TrimSpace(match[2]),
+			Version:    version,
+			Depth:      depth,
+		})
+	}
+	return out
 }
 
 func dedupeWarnings(in []string) []string {
