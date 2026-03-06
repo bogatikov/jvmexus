@@ -80,4 +80,49 @@ CREATE TABLE IF NOT EXISTS symbol_refs (
 
 CREATE INDEX IF NOT EXISTS idx_symbol_refs_project_to_name ON symbol_refs(project_id, to_name);
 CREATE INDEX IF NOT EXISTS idx_symbol_refs_project_to_fq ON symbol_refs(project_id, to_fq_name);
+
+CREATE TABLE IF NOT EXISTS chunks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  file_path TEXT NOT NULL,
+  language TEXT NOT NULL,
+  chunk_type TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  symbol_name TEXT,
+  text TEXT NOT NULL,
+  token_count INTEGER NOT NULL DEFAULT 0,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunks_project ON chunks(project_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_project_file ON chunks(project_id, file_path);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+  project_id UNINDEXED,
+  file_path,
+  language,
+  chunk_type,
+  symbol_name,
+  text,
+  content='chunks',
+  content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+  INSERT INTO chunks_fts(rowid, project_id, file_path, language, chunk_type, symbol_name, text)
+  VALUES (new.id, new.project_id, new.file_path, new.language, new.chunk_type, ifnull(new.symbol_name,''), new.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+  INSERT INTO chunks_fts(chunks_fts, rowid, project_id, file_path, language, chunk_type, symbol_name, text)
+  VALUES('delete', old.id, old.project_id, old.file_path, old.language, old.chunk_type, ifnull(old.symbol_name,''), old.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+  INSERT INTO chunks_fts(chunks_fts, rowid, project_id, file_path, language, chunk_type, symbol_name, text)
+  VALUES('delete', old.id, old.project_id, old.file_path, old.language, old.chunk_type, ifnull(old.symbol_name,''), old.text);
+  INSERT INTO chunks_fts(rowid, project_id, file_path, language, chunk_type, symbol_name, text)
+  VALUES (new.id, new.project_id, new.file_path, new.language, new.chunk_type, ifnull(new.symbol_name,''), new.text);
+END;
 `

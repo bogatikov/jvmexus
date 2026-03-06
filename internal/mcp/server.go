@@ -9,12 +9,14 @@ import (
 
 	"github.com/bgtkv/jvmexus/internal/config"
 	"github.com/bgtkv/jvmexus/internal/indexer"
+	"github.com/bgtkv/jvmexus/internal/rag"
 	"github.com/bgtkv/jvmexus/internal/store"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
 func NewServer(cfg config.Config, st *store.Store) *server.MCPServer {
+	searcher := rag.NewSearcher(cfg, st)
 	srv := server.NewMCPServer(
 		"JVMexus",
 		"0.1.0",
@@ -26,7 +28,7 @@ func NewServer(cfg config.Config, st *store.Store) *server.MCPServer {
 	registerIndexProjectTool(srv, st, cfg)
 	registerGetDependenciesTool(srv, st)
 	registerGetBuildGraphTool(srv, st)
-	registerQueryCodeTool(srv)
+	registerQueryCodeTool(srv, st, searcher)
 	registerGetSymbolContextTool(srv, st)
 	registerResources(srv, st)
 
@@ -283,14 +285,15 @@ func buildGraphPayload(ctx context.Context, st *store.Store, project store.Proje
 	}, nil
 }
 
-func registerQueryCodeTool(srv *server.MCPServer) {
+func registerQueryCodeTool(srv *server.MCPServer, st *store.Store, searcher *rag.Searcher) {
 	tool := mcp.NewTool(
 		"query_code",
-		mcp.WithDescription("Hybrid code query over BM25 + vectors (placeholder for upcoming phase)"),
+		mcp.WithDescription("Search indexed code/build chunks using FTS and return relevant snippets"),
 		mcp.WithString("project", mcp.Required(), mcp.Description("Project name or root path")),
 		mcp.WithString("query", mcp.Required(), mcp.Description("Natural-language query")),
+		mcp.WithNumber("limit", mcp.Description("Maximum number of chunks to return (default 10)")),
 	)
-	srv.AddTool(tool, func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	srv.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		projectArg, err := req.RequireString("project")
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -299,11 +302,24 @@ func registerQueryCodeTool(srv *server.MCPServer) {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		project, err := st.FindProject(ctx, projectArg)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		limit := req.GetInt("limit", 10)
+		results, err := searcher.Search(ctx, project.ID, query, limit)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("search chunks: %v", err)), nil
+		}
 		payload := map[string]any{
-			"project": projectArg,
-			"query":   query,
-			"status":  "not_implemented",
-			"phase":   "Phase 5 - Local Embeddings + Hybrid Retrieval",
+			"project":       project,
+			"query":         query,
+			"limit":         limit,
+			"total":         len(results),
+			"results":       results,
+			"retrievalMode": "hybrid:fts5+local-vector-rerank",
+			"model":         searcher.ModelID(),
+			"note":          "local vector embeddings are hashed baseline while full model-backed embeddings are in progress",
 		}
 		return jsonToolResult(payload)
 	})

@@ -142,6 +142,14 @@ func (s *Service) IndexProject(ctx context.Context, path string, _ Options) (Res
 		return Result{}, fmt.Errorf("persist symbol references: %w", err)
 	}
 
+	chunks, chunkWarnings, err := extractProjectChunks(absRoot)
+	if err != nil {
+		return Result{}, fmt.Errorf("extract chunks: %w", err)
+	}
+	if err := s.store.ReplaceChunks(ctx, project.ID, chunks); err != nil {
+		return Result{}, fmt.Errorf("persist chunks: %w", err)
+	}
+
 	fileCount, err := countSourceFiles(absRoot)
 	if err != nil {
 		return Result{}, fmt.Errorf("count source files: %w", err)
@@ -152,6 +160,7 @@ func (s *Service) IndexProject(ctx context.Context, path string, _ Options) (Res
 	warnings = append(warnings, resolveWarnings...)
 	warnings = append(warnings, sourceWarnings...)
 	warnings = append(warnings, symbolWarnings...)
+	warnings = append(warnings, chunkWarnings...)
 
 	return Result{
 		ProjectName: project.Name,
@@ -227,4 +236,107 @@ func extractProjectSymbols(root string) ([]parser.Symbol, []parser.Reference, []
 	}
 
 	return symbols, refs, warnings, nil
+}
+
+func extractProjectChunks(root string) ([]store.Chunk, []string, error) {
+	var chunks []store.Chunk
+	var warnings []string
+
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("walk error on %s: %v", path, err))
+			return nil
+		}
+		if d.IsDir() {
+			base := d.Name()
+			if base == ".git" || base == ".gradle" || base == ".idea" || base == "build" || base == "node_modules" || base == ".jvmexus" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		name := d.Name()
+		ext := strings.ToLower(filepath.Ext(name))
+		isCode := ext == ".java" || ext == ".kt" || ext == ".kts"
+		isBuild := name == "build.gradle" || name == "build.gradle.kts" || name == "settings.gradle" || name == "settings.gradle.kts"
+		if !isCode && !isBuild {
+			return nil
+		}
+
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			warnings = append(warnings, fmt.Sprintf("unable to read %s: %v", path, readErr))
+			return nil
+		}
+		relPath := path
+		if rel, relErr := filepath.Rel(root, path); relErr == nil {
+			relPath = rel
+		}
+
+		language := "text"
+		switch ext {
+		case ".java":
+			language = "java"
+		case ".kt", ".kts":
+			language = "kotlin"
+		}
+		chunkType := "code_window"
+		if isBuild {
+			chunkType = "build_window"
+			if language == "text" {
+				language = "gradle"
+			}
+		}
+
+		fileChunks := chunkText(string(content), relPath, language, chunkType)
+		chunks = append(chunks, fileChunks...)
+		return nil
+	})
+	if err != nil {
+		return nil, warnings, err
+	}
+
+	return chunks, warnings, nil
+}
+
+func chunkText(content, filePath, language, chunkType string) []store.Chunk {
+	const windowSize = 80
+	const overlap = 20
+	step := windowSize - overlap
+	if step <= 0 {
+		step = windowSize
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) == 0 {
+		return nil
+	}
+
+	chunks := make([]store.Chunk, 0, (len(lines)/step)+1)
+	chunkIdx := 0
+	for start := 0; start < len(lines); start += step {
+		end := start + windowSize
+		if end > len(lines) {
+			end = len(lines)
+		}
+		text := strings.TrimSpace(strings.Join(lines[start:end], "\n"))
+		if text == "" {
+			if end == len(lines) {
+				break
+			}
+			continue
+		}
+		chunks = append(chunks, store.Chunk{
+			FilePath:   filePath,
+			Language:   language,
+			ChunkType:  chunkType,
+			ChunkIndex: chunkIdx,
+			Text:       text,
+			TokenCount: len(strings.Fields(text)),
+		})
+		chunkIdx++
+		if end == len(lines) {
+			break
+		}
+	}
+	return chunks
 }

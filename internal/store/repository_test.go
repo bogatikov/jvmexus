@@ -136,3 +136,39 @@ func TestSymbolQueries_FindWithFilterAndOutgoingRefs(t *testing.T) {
 		t.Fatalf("expected outgoing refs, got 0")
 	}
 }
+
+func TestSearchChunks_ReturnsFTSMatches(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	st, err := Open(filepath.Join(tmp, "chunks.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate store: %v", err)
+	}
+
+	project, err := st.UpsertProject(ctx, "demo", "/tmp/demo")
+	if err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+
+	chunks := []Chunk{
+		{FilePath: "src/main/java/com/example/Util.java", Language: "java", ChunkType: "code_window", ChunkIndex: 0, Text: "public class Util { static String helper() { return \"pong\"; } }", TokenCount: 12},
+		{FilePath: "src/main/java/com/example/Bot.java", Language: "java", ChunkType: "code_window", ChunkIndex: 0, Text: "public class Bot { String ping() { return Util.helper(); } }", TokenCount: 12},
+	}
+	if err := st.ReplaceChunks(ctx, project.ID, chunks); err != nil {
+		t.Fatalf("replace chunks: %v", err)
+	}
+
+	results, err := st.SearchChunks(ctx, project.ID, "Util helper", 5)
+	if err != nil {
+		t.Fatalf("search chunks: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatalf("expected at least one chunk match")
+	}
+}

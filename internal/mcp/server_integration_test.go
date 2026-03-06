@@ -132,6 +132,11 @@ public class Util {
 		t.Fatalf("expected build-graph resource nodeCount >= 2, got %#v", buildGraphResource["nodeCount"])
 	}
 
+	queryResult := mustCallTool(t, srv, "query_code", map[string]any{"project": projectName, "query": "Util helper", "limit": 5})
+	if intFromAny(queryResult["total"]) < 1 {
+		t.Fatalf("expected query_code total >= 1, got %#v", queryResult)
+	}
+
 	symbolResult := mustCallTool(t, srv, "get_symbol_context", map[string]any{"project": projectName, "symbol": "ping"})
 	if intFromAny(symbolResult["count"]) < 1 {
 		t.Fatalf("expected at least one symbol context for ping, got %#v", symbolResult)

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -56,6 +58,18 @@ type SymbolReference struct {
 	RefType    string  `json:"refType"`
 	Confidence float64 `json:"confidence"`
 	Evidence   string  `json:"evidence,omitempty"`
+}
+
+type Chunk struct {
+	ID         int64   `json:"id"`
+	FilePath   string  `json:"filePath"`
+	Language   string  `json:"language"`
+	ChunkType  string  `json:"chunkType"`
+	ChunkIndex int     `json:"chunkIndex"`
+	SymbolName string  `json:"symbolName,omitempty"`
+	Text       string  `json:"text"`
+	TokenCount int     `json:"tokenCount"`
+	Score      float64 `json:"score,omitempty"`
 }
 
 func (s *Store) UpsertProject(ctx context.Context, name, rootPath string) (Project, error) {
@@ -283,6 +297,106 @@ func nullable(value string) any {
 		return nil
 	}
 	return value
+}
+
+func (s *Store) ReplaceChunks(ctx context.Context, projectID int64, chunks []Chunk) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx replace chunks: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM chunks WHERE project_id = ?`, projectID); err != nil {
+		return fmt.Errorf("delete chunks: %w", err)
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO chunks(project_id, file_path, language, chunk_type, chunk_index, symbol_name, text, token_count)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare insert chunks: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, chunk := range chunks {
+		if _, err := stmt.ExecContext(ctx,
+			projectID,
+			chunk.FilePath,
+			chunk.Language,
+			chunk.ChunkType,
+			chunk.ChunkIndex,
+			nullable(chunk.SymbolName),
+			chunk.Text,
+			chunk.TokenCount,
+		); err != nil {
+			return fmt.Errorf("insert chunk %s#%d: %w", chunk.FilePath, chunk.ChunkIndex, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit chunks: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) SearchChunks(ctx context.Context, projectID int64, query string, limit int) ([]Chunk, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	ftsQuery := buildFTSQuery(query)
+	if ftsQuery == "" {
+		return nil, nil
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT c.id, c.file_path, c.language, c.chunk_type, c.chunk_index, ifnull(c.symbol_name,''), c.text, c.token_count, bm25(chunks_fts) AS score
+		FROM chunks_fts
+		JOIN chunks c ON c.id = chunks_fts.rowid
+		WHERE chunks_fts MATCH ? AND c.project_id = ?
+		ORDER BY score ASC
+		LIMIT ?
+	`, ftsQuery, projectID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query chunks fts: %w", err)
+	}
+	defer rows.Close()
+
+	results := make([]Chunk, 0, limit)
+	for rows.Next() {
+		var c Chunk
+		if err := rows.Scan(&c.ID, &c.FilePath, &c.Language, &c.ChunkType, &c.ChunkIndex, &c.SymbolName, &c.Text, &c.TokenCount, &c.Score); err != nil {
+			return nil, fmt.Errorf("scan chunk search result: %w", err)
+		}
+		results = append(results, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate chunk search results: %w", err)
+	}
+	return results, nil
+}
+
+var nonTokenRE = regexp.MustCompile(`[^a-zA-Z0-9_]+`)
+
+func buildFTSQuery(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	tokens := strings.Fields(raw)
+	clean := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		token = nonTokenRE.ReplaceAllString(token, "")
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		clean = append(clean, token+"*")
+	}
+	if len(clean) == 0 {
+		return ""
+	}
+	return strings.Join(clean, " OR ")
 }
 
 func (s *Store) ReplaceSymbols(ctx context.Context, projectID int64, symbols []Symbol) error {
