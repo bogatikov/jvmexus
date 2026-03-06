@@ -63,7 +63,7 @@ func registerResources(srv *server.MCPServer, st *store.Store) {
 	summaryTemplate := mcp.NewResourceTemplate(
 		"jvminfo://project/{name}/summary",
 		"Project Summary",
-		mcp.WithTemplateDescription("Summary including dependency source attachment stats"),
+		mcp.WithTemplateDescription("Summary including direct dependency source-attachment stats"),
 		mcp.WithTemplateMIMEType("application/json"),
 	)
 	srv.AddResourceTemplate(summaryTemplate, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
@@ -85,6 +85,7 @@ func registerResources(srv *server.MCPServer, st *store.Store) {
 		}
 		payload, err := toJSON(map[string]any{
 			"project":     project,
+			"total":       len(dependencies),
 			"totalDeps":   len(dependencies),
 			"sourceStats": sourceStats,
 		})
@@ -103,7 +104,7 @@ func registerResources(srv *server.MCPServer, st *store.Store) {
 	depsTemplate := mcp.NewResourceTemplate(
 		"jvminfo://project/{name}/dependencies",
 		"Project Dependencies",
-		mcp.WithTemplateDescription("Dependencies with source attachment metadata"),
+		mcp.WithTemplateDescription("Direct dependencies with source attachment metadata"),
 		mcp.WithTemplateMIMEType("application/json"),
 	)
 	srv.AddResourceTemplate(depsTemplate, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
@@ -288,10 +289,10 @@ func buildGraphPayload(ctx context.Context, st *store.Store, project store.Proje
 func registerQueryCodeTool(srv *server.MCPServer, st *store.Store, searcher *rag.Searcher) {
 	tool := mcp.NewTool(
 		"query_code",
-		mcp.WithDescription("Search indexed code/build chunks using FTS and return relevant snippets"),
+		mcp.WithDescription("Search indexed code/build chunks using hybrid retrieval (FTS5 + local vector rerank)"),
 		mcp.WithString("project", mcp.Required(), mcp.Description("Project name or root path")),
 		mcp.WithString("query", mcp.Required(), mcp.Description("Natural-language query")),
-		mcp.WithNumber("limit", mcp.Description("Maximum number of chunks to return (default 10)")),
+		mcp.WithNumber("limit", mcp.Description("Maximum number of chunks to return (integer, default 10)")),
 	)
 	srv.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		projectArg, err := req.RequireString("project")
@@ -319,7 +320,7 @@ func registerQueryCodeTool(srv *server.MCPServer, st *store.Store, searcher *rag
 			"results":       results,
 			"retrievalMode": "hybrid:fts5+local-vector-rerank",
 			"model":         searcher.ModelID(),
-			"note":          "local vector embeddings are hashed baseline while full model-backed embeddings are in progress",
+			"note":          "local embeddings run via fastembed when available, with hashed fallback for offline robustness",
 		}
 		return jsonToolResult(payload)
 	})
@@ -332,7 +333,7 @@ func registerGetSymbolContextTool(srv *server.MCPServer, st *store.Store) {
 		mcp.WithString("project", mcp.Required(), mcp.Description("Project name or root path")),
 		mcp.WithString("symbol", mcp.Required(), mcp.Description("Symbol or fully-qualified name")),
 		mcp.WithString("filePath", mcp.Description("Optional file path filter for disambiguation")),
-		mcp.WithNumber("limit", mcp.Description("Maximum symbols to return (default 20)")),
+		mcp.WithNumber("limit", mcp.Description("Maximum symbols to return (integer, default 20)")),
 	)
 	srv.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		projectArg, err := req.RequireString("project")
@@ -517,12 +518,7 @@ func registerIndexProjectTool(srv *server.MCPServer, st *store.Store, cfg config
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		force := false
-		if rawForce, ok := req.GetArguments()["force"]; ok {
-			if value, ok := rawForce.(bool); ok {
-				force = value
-			}
-		}
+		force := req.GetBool("force", false)
 
 		ix := indexer.New(st, cfg)
 		result, err := ix.IndexProject(ctx, path, indexer.Options{Force: force})
