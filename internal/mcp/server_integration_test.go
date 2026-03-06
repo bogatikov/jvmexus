@@ -31,6 +31,20 @@ dependencies {
 `), 0o644); err != nil {
 		t.Fatalf("write build file: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(repo, "app", "src", "main", "java", "com", "example"), 0o755); err != nil {
+		t.Fatalf("create source dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "app", "src", "main", "java", "com", "example", "Bot.java"), []byte(`
+package com.example;
+
+import java.util.List;
+
+public class Bot {
+  public String ping() { return "pong"; }
+}
+`), 0o644); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
 
 	gradleHome := filepath.Join(tmp, "gradle-home")
 	t.Setenv("GRADLE_USER_HOME", gradleHome)
@@ -94,6 +108,11 @@ dependencies {
 	}
 	if dep["sourceStatus"] != gradle.SourceStatusAttached {
 		t.Fatalf("expected sourceStatus %q, got %#v", gradle.SourceStatusAttached, dep["sourceStatus"])
+	}
+
+	symbolResult := mustCallTool(t, srv, "get_symbol_context", map[string]any{"project": projectName, "symbol": "Bot"})
+	if intFromAny(symbolResult["count"]) < 1 {
+		t.Fatalf("expected at least one symbol context for Bot, got %#v", symbolResult)
 	}
 }
 

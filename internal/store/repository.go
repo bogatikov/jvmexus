@@ -36,6 +36,28 @@ type Dependency struct {
 	Confidence     float64 `json:"confidence"`
 }
 
+type Symbol struct {
+	ID        int64  `json:"id"`
+	FilePath  string `json:"filePath"`
+	Language  string `json:"language"`
+	Name      string `json:"name"`
+	FQName    string `json:"fqName"`
+	Kind      string `json:"kind"`
+	StartLine int    `json:"startLine"`
+	EndLine   int    `json:"endLine"`
+	Signature string `json:"signature,omitempty"`
+}
+
+type SymbolReference struct {
+	FromName   string  `json:"fromName"`
+	FromFile   string  `json:"fromFile"`
+	ToName     string  `json:"toName"`
+	ToFQName   string  `json:"toFqName,omitempty"`
+	RefType    string  `json:"refType"`
+	Confidence float64 `json:"confidence"`
+	Evidence   string  `json:"evidence,omitempty"`
+}
+
 func (s *Store) UpsertProject(ctx context.Context, name, rootPath string) (Project, error) {
 	if _, err := s.db.ExecContext(ctx, `
 		INSERT INTO projects(name, root_path)
@@ -235,4 +257,147 @@ func nullable(value string) any {
 		return nil
 	}
 	return value
+}
+
+func (s *Store) ReplaceSymbols(ctx context.Context, projectID int64, symbols []Symbol) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx replace symbols: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM symbols WHERE project_id = ?`, projectID); err != nil {
+		return fmt.Errorf("delete symbols: %w", err)
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO symbols(project_id, file_path, language, name, fq_name, kind, start_line, end_line, signature)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare insert symbols: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, sym := range symbols {
+		if _, err := stmt.ExecContext(ctx,
+			projectID,
+			sym.FilePath,
+			sym.Language,
+			sym.Name,
+			sym.FQName,
+			sym.Kind,
+			sym.StartLine,
+			sym.EndLine,
+			nullable(sym.Signature),
+		); err != nil {
+			return fmt.Errorf("insert symbol %s: %w", sym.Name, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit symbols: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ReplaceSymbolReferences(ctx context.Context, projectID int64, refs []SymbolReference) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx replace refs: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM symbol_refs WHERE project_id = ?`, projectID); err != nil {
+		return fmt.Errorf("delete symbol refs: %w", err)
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO symbol_refs(project_id, from_name, from_file_path, to_name, to_fq_name, ref_type, confidence, evidence)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare insert refs: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, ref := range refs {
+		if _, err := stmt.ExecContext(ctx,
+			projectID,
+			ref.FromName,
+			ref.FromFile,
+			ref.ToName,
+			nullable(ref.ToFQName),
+			ref.RefType,
+			ref.Confidence,
+			nullable(ref.Evidence),
+		); err != nil {
+			return fmt.Errorf("insert symbol ref %s->%s: %w", ref.FromName, ref.ToName, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit refs: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) FindSymbols(ctx context.Context, projectID int64, symbolQuery string, limit int) ([]Symbol, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, file_path, language, name, fq_name, kind, start_line, end_line, ifnull(signature,'')
+		FROM symbols
+		WHERE project_id = ? AND (name = ? OR fq_name = ? OR name LIKE ? OR fq_name LIKE ?)
+		ORDER BY CASE WHEN name = ? OR fq_name = ? THEN 0 ELSE 1 END, name ASC
+		LIMIT ?
+	`, projectID, symbolQuery, symbolQuery, symbolQuery+"%", symbolQuery+"%", symbolQuery, symbolQuery, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query symbols: %w", err)
+	}
+	defer rows.Close()
+
+	result := make([]Symbol, 0, limit)
+	for rows.Next() {
+		var sym Symbol
+		if err := rows.Scan(&sym.ID, &sym.FilePath, &sym.Language, &sym.Name, &sym.FQName, &sym.Kind, &sym.StartLine, &sym.EndLine, &sym.Signature); err != nil {
+			return nil, fmt.Errorf("scan symbol: %w", err)
+		}
+		result = append(result, sym)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate symbols: %w", err)
+	}
+	return result, nil
+}
+
+func (s *Store) ListIncomingReferences(ctx context.Context, projectID int64, symbol Symbol, limit int) ([]SymbolReference, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT from_name, from_file_path, to_name, ifnull(to_fq_name,''), ref_type, confidence, ifnull(evidence,'')
+		FROM symbol_refs
+		WHERE project_id = ? AND (to_name = ? OR to_fq_name = ?)
+		ORDER BY ref_type ASC, confidence DESC, from_name ASC
+		LIMIT ?
+	`, projectID, symbol.Name, symbol.FQName, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query incoming refs: %w", err)
+	}
+	defer rows.Close()
+
+	refs := make([]SymbolReference, 0, limit)
+	for rows.Next() {
+		var ref SymbolReference
+		if err := rows.Scan(&ref.FromName, &ref.FromFile, &ref.ToName, &ref.ToFQName, &ref.RefType, &ref.Confidence, &ref.Evidence); err != nil {
+			return nil, fmt.Errorf("scan incoming ref: %w", err)
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate incoming refs: %w", err)
+	}
+	return refs, nil
 }

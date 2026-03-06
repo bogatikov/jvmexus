@@ -27,7 +27,7 @@ func NewServer(cfg config.Config, st *store.Store) *server.MCPServer {
 	registerGetDependenciesTool(srv, st)
 	registerGetBuildGraphTool(srv)
 	registerQueryCodeTool(srv)
-	registerGetSymbolContextTool(srv)
+	registerGetSymbolContextTool(srv, st)
 	registerResources(srv, st)
 
 	return srv
@@ -202,14 +202,14 @@ func registerQueryCodeTool(srv *server.MCPServer) {
 	})
 }
 
-func registerGetSymbolContextTool(srv *server.MCPServer) {
+func registerGetSymbolContextTool(srv *server.MCPServer, st *store.Store) {
 	tool := mcp.NewTool(
 		"get_symbol_context",
-		mcp.WithDescription("Return symbol context with callers/callees/importers (placeholder for upcoming phase)"),
+		mcp.WithDescription("Return symbol context with incoming references (best effort)"),
 		mcp.WithString("project", mcp.Required(), mcp.Description("Project name or root path")),
 		mcp.WithString("symbol", mcp.Required(), mcp.Description("Symbol or fully-qualified name")),
 	)
-	srv.AddTool(tool, func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	srv.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		projectArg, err := req.RequireString("project")
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -218,11 +218,36 @@ func registerGetSymbolContextTool(srv *server.MCPServer) {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+
+		project, err := st.FindProject(ctx, projectArg)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		symbols, err := st.FindSymbols(ctx, project.ID, symbol, 20)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("find symbols: %v", err)), nil
+		}
+
+		type symbolContext struct {
+			Symbol   store.Symbol            `json:"symbol"`
+			Incoming []store.SymbolReference `json:"incoming"`
+		}
+		contexts := make([]symbolContext, 0, len(symbols))
+		for _, sym := range symbols {
+			incoming, incomingErr := st.ListIncomingReferences(ctx, project.ID, sym, 100)
+			if incomingErr != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("load incoming references for %s: %v", sym.Name, incomingErr)), nil
+			}
+			contexts = append(contexts, symbolContext{Symbol: sym, Incoming: incoming})
+		}
+
 		payload := map[string]any{
-			"project": projectArg,
-			"symbol":  symbol,
-			"status":  "not_implemented",
-			"phase":   "Phase 3 - Java/Kotlin Symbol Extraction",
+			"project":  project,
+			"query":    symbol,
+			"count":    len(contexts),
+			"contexts": contexts,
+			"note":     "incoming references currently focus on imports and lightweight parser signals",
 		}
 		return jsonToolResult(payload)
 	})
