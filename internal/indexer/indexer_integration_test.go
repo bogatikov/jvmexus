@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"archive/zip"
 	"context"
 	"os"
 	"path/filepath"
@@ -236,8 +237,26 @@ func prepareGradleCache(t *testing.T, tmp string) (string, string) {
 	if err := os.WriteFile(binaryJar, []byte("binary"), 0o644); err != nil {
 		t.Fatalf("write binary jar: %v", err)
 	}
-	if err := os.WriteFile(sourceJar, []byte("source"), 0o644); err != nil {
-		t.Fatalf("write source jar: %v", err)
+	sourceFile, err := os.Create(sourceJar)
+	if err != nil {
+		t.Fatalf("create source jar: %v", err)
+	}
+	zipWriter := zip.NewWriter(sourceFile)
+	entry, err := zipWriter.Create("org/slf4j/Logger.java")
+	if err != nil {
+		_ = sourceFile.Close()
+		t.Fatalf("create source entry: %v", err)
+	}
+	if _, err := entry.Write([]byte("package org.slf4j; public interface Logger { void info(String msg); }")); err != nil {
+		_ = sourceFile.Close()
+		t.Fatalf("write source entry: %v", err)
+	}
+	if err := zipWriter.Close(); err != nil {
+		_ = sourceFile.Close()
+		t.Fatalf("close source zip writer: %v", err)
+	}
+	if err := sourceFile.Close(); err != nil {
+		t.Fatalf("close source jar: %v", err)
 	}
 	return binaryJar, sourceJar
 }

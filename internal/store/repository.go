@@ -383,6 +383,10 @@ func (s *Store) DeleteChunksByFilePaths(ctx context.Context, projectID int64, fi
 }
 
 func (s *Store) SearchChunks(ctx context.Context, projectID int64, query string, limit int) ([]Chunk, error) {
+	return s.SearchChunksWithScope(ctx, projectID, query, limit, "all")
+}
+
+func (s *Store) SearchChunksWithScope(ctx context.Context, projectID int64, query string, limit int, scope string) ([]Chunk, error) {
 	if limit <= 0 {
 		limit = 10
 	}
@@ -390,15 +394,27 @@ func (s *Store) SearchChunks(ctx context.Context, projectID int64, query string,
 	if ftsQuery == "" {
 		return nil, nil
 	}
+	if scope != "project" && scope != "libraries" && scope != "all" {
+		scope = "all"
+	}
 
-	rows, err := s.db.QueryContext(ctx, `
+	whereScope := ""
+	if scope == "project" {
+		whereScope = " AND c.file_path NOT LIKE 'jar://%'"
+	} else if scope == "libraries" {
+		whereScope = " AND c.file_path LIKE 'jar://%'"
+	}
+
+	querySQL := `
 		SELECT c.id, c.file_path, c.language, c.chunk_type, c.chunk_index, ifnull(c.symbol_name,''), c.text, c.token_count, bm25(chunks_fts) AS score
 		FROM chunks_fts
 		JOIN chunks c ON c.id = chunks_fts.rowid
-		WHERE chunks_fts MATCH ? AND c.project_id = ?
+		WHERE chunks_fts MATCH ? AND c.project_id = ?` + whereScope + `
 		ORDER BY score ASC
 		LIMIT ?
-	`, ftsQuery, projectID, limit)
+	`
+
+	rows, err := s.db.QueryContext(ctx, querySQL, ftsQuery, projectID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("query chunks fts: %w", err)
 	}

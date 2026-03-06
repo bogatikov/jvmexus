@@ -274,6 +274,20 @@ func buildGraphPayload(ctx context.Context, st *store.Store, project store.Proje
 		}
 		moduleID := "module:" + dep.ModuleName
 		edges = append(edges, edge{From: moduleID, To: depID, EdgeType: "DEPENDS_ON", Metadata: map[string]any{"scope": dep.Scope, "kind": dep.Kind}})
+
+		if dep.SourceJarPath != "" {
+			sourceNodeID := "dependency-source:" + depLabel
+			if _, ok := nodeSeen[sourceNodeID]; !ok {
+				nodeSeen[sourceNodeID] = struct{}{}
+				nodes = append(nodes, node{
+					ID:       sourceNodeID,
+					NodeType: "dependency_source",
+					Label:    depLabel + "-sources",
+					Metadata: map[string]any{"sourceJarPath": dep.SourceJarPath, "sourceStatus": dep.SourceStatus},
+				})
+			}
+			edges = append(edges, edge{From: depID, To: sourceNodeID, EdgeType: "HAS_SOURCE"})
+		}
 	}
 
 	return map[string]any{
@@ -292,6 +306,7 @@ func registerQueryCodeTool(srv *server.MCPServer, st *store.Store, searcher *rag
 		mcp.WithDescription("Search indexed code/build chunks using hybrid retrieval (FTS5 + local vector rerank)"),
 		mcp.WithString("project", mcp.Required(), mcp.Description("Project name or root path")),
 		mcp.WithString("query", mcp.Required(), mcp.Description("Natural-language query")),
+		mcp.WithString("scope", mcp.Description("Search scope: all, project, or libraries (default all)")),
 		mcp.WithNumber("limit", mcp.Description("Maximum number of chunks to return (integer, default 10)")),
 	)
 	srv.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -307,14 +322,16 @@ func registerQueryCodeTool(srv *server.MCPServer, st *store.Store, searcher *rag
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		scope := req.GetString("scope", "all")
 		limit := req.GetInt("limit", 10)
-		results, err := searcher.Search(ctx, project.ID, query, limit)
+		results, err := searcher.SearchWithScope(ctx, project.ID, query, limit, scope)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("search chunks: %v", err)), nil
 		}
 		payload := map[string]any{
 			"project":       project,
 			"query":         query,
+			"scope":         scope,
 			"limit":         limit,
 			"total":         len(results),
 			"results":       results,

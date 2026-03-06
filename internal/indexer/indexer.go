@@ -1,10 +1,12 @@
 package indexer
 
 import (
+	"archive/zip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -15,6 +17,11 @@ import (
 	"github.com/bgtkv/jvmexus/internal/gradle"
 	"github.com/bgtkv/jvmexus/internal/parser"
 	"github.com/bgtkv/jvmexus/internal/store"
+)
+
+const (
+	maxSourceJarEntries = 2000
+	maxSourceFileBytes  = 1024 * 1024
 )
 
 type Options struct {
@@ -354,11 +361,25 @@ func (s *Service) fullReindex(ctx context.Context, absRoot string, project store
 		return Result{}, fmt.Errorf("persist symbol references: %w", err)
 	}
 
+	notify("Indexing attached dependency source jars")
+	depSymbols, depRefs, depChunks, depSourceWarnings := extractDependencySourceIndex(storeDeps)
+	if len(depSymbols) > 0 {
+		if err := s.store.InsertSymbols(ctx, project.ID, depSymbols); err != nil {
+			return Result{}, fmt.Errorf("persist dependency source symbols: %w", err)
+		}
+	}
+	if len(depRefs) > 0 {
+		if err := s.store.InsertSymbolReferences(ctx, project.ID, depRefs); err != nil {
+			return Result{}, fmt.Errorf("persist dependency source references: %w", err)
+		}
+	}
+
 	notify("Chunking project files for retrieval")
 	chunks, chunkWarnings, err := extractProjectChunks(absRoot)
 	if err != nil {
 		return Result{}, fmt.Errorf("extract chunks: %w", err)
 	}
+	chunks = append(chunks, depChunks...)
 	notify("Persisting retrieval chunks")
 	if err := s.store.ReplaceChunks(ctx, project.ID, chunks); err != nil {
 		return Result{}, fmt.Errorf("persist chunks: %w", err)
@@ -374,6 +395,7 @@ func (s *Service) fullReindex(ctx context.Context, absRoot string, project store
 	warnings = append(warnings, dependencyWarnings...)
 	warnings = append(warnings, resolveWarnings...)
 	warnings = append(warnings, sourceWarnings...)
+	warnings = append(warnings, depSourceWarnings...)
 	warnings = append(warnings, symbolWarnings...)
 	warnings = append(warnings, chunkWarnings...)
 
@@ -741,4 +763,124 @@ func extractChunksFromFiles(root string, filePaths []string) ([]store.Chunk, []s
 	}
 
 	return chunks, warnings, nil
+}
+
+func extractDependencySourceIndex(deps []store.Dependency) ([]store.Symbol, []store.SymbolReference, []store.Chunk, []string) {
+	symbols := make([]store.Symbol, 0, 256)
+	refs := make([]store.SymbolReference, 0, 512)
+	chunks := make([]store.Chunk, 0, 512)
+	warnings := make([]string, 0, 16)
+	seenJar := make(map[string]struct{}, len(deps))
+
+	for _, dep := range deps {
+		if dep.SourceJarPath == "" {
+			continue
+		}
+		if _, ok := seenJar[dep.SourceJarPath]; ok {
+			continue
+		}
+		seenJar[dep.SourceJarPath] = struct{}{}
+
+		coord := strings.Trim(strings.Join([]string{dep.GroupID, dep.ArtifactID, dep.Version}, ":"), ":")
+		jarSymbols, jarRefs, jarChunks, jarWarnings := extractSourceJarArtifacts(dep.SourceJarPath, coord)
+		symbols = append(symbols, jarSymbols...)
+		refs = append(refs, jarRefs...)
+		chunks = append(chunks, jarChunks...)
+		warnings = append(warnings, jarWarnings...)
+	}
+
+	return symbols, refs, chunks, warnings
+}
+
+func extractSourceJarArtifacts(jarPath, coord string) ([]store.Symbol, []store.SymbolReference, []store.Chunk, []string) {
+	symbols := make([]store.Symbol, 0, 128)
+	refs := make([]store.SymbolReference, 0, 256)
+	chunks := make([]store.Chunk, 0, 256)
+	warnings := make([]string, 0, 4)
+
+	r, err := zip.OpenReader(jarPath)
+	if err != nil {
+		warnings = append(warnings, fmt.Sprintf("unable to open source jar %s: %v", jarPath, err))
+		return symbols, refs, chunks, warnings
+	}
+	defer r.Close()
+
+	indexedEntries := 0
+	for _, f := range r.File {
+		if indexedEntries >= maxSourceJarEntries {
+			warnings = append(warnings, fmt.Sprintf("source jar %s truncated after %d files", jarPath, maxSourceJarEntries))
+			break
+		}
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(f.Name))
+		if ext != ".java" && ext != ".kt" && ext != ".kts" {
+			continue
+		}
+		if f.UncompressedSize64 > maxSourceFileBytes {
+			warnings = append(warnings, fmt.Sprintf("skipping large source entry %s in %s", f.Name, jarPath))
+			continue
+		}
+
+		rc, openErr := f.Open()
+		if openErr != nil {
+			warnings = append(warnings, fmt.Sprintf("unable to open source entry %s in %s: %v", f.Name, jarPath, openErr))
+			continue
+		}
+		content, readErr := io.ReadAll(io.LimitReader(rc, maxSourceFileBytes+1))
+		_ = rc.Close()
+		if readErr != nil {
+			warnings = append(warnings, fmt.Sprintf("unable to read source entry %s in %s: %v", f.Name, jarPath, readErr))
+			continue
+		}
+		if len(content) > maxSourceFileBytes {
+			warnings = append(warnings, fmt.Sprintf("skipping oversized source entry %s in %s", f.Name, jarPath))
+			continue
+		}
+
+		virtualPath := buildJarVirtualPath(coord, f.Name)
+		parsedSymbols, parsedRefs := parser.ParseFile(virtualPath, content)
+		for _, sym := range parsedSymbols {
+			symbols = append(symbols, store.Symbol{
+				FilePath:  sym.FilePath,
+				Language:  sym.Language,
+				Name:      sym.Name,
+				FQName:    sym.FQName,
+				Kind:      sym.Kind,
+				StartLine: sym.StartLine,
+				EndLine:   sym.EndLine,
+				Signature: sym.Signature,
+			})
+		}
+		for _, ref := range parsedRefs {
+			refs = append(refs, store.SymbolReference{
+				FromName:   ref.FromName,
+				FromFile:   ref.FromFile,
+				ToName:     ref.ToName,
+				ToFQName:   ref.ToFQName,
+				RefType:    ref.RefType,
+				Confidence: ref.Confidence,
+				Evidence:   ref.Evidence,
+			})
+		}
+
+		language := "java"
+		if ext == ".kt" || ext == ".kts" {
+			language = "kotlin"
+		}
+		chunks = append(chunks, chunkText(string(content), virtualPath, language, "library_code_window")...)
+		indexedEntries++
+	}
+
+	return symbols, refs, chunks, warnings
+}
+
+func buildJarVirtualPath(coord, entry string) string {
+	entry = strings.TrimPrefix(entry, "/")
+	coord = strings.TrimSpace(coord)
+	if coord == "" {
+		coord = "unknown:unknown"
+	}
+	return "jar://" + coord + "!/" + entry
 }

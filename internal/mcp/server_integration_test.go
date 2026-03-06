@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"os"
@@ -66,8 +67,26 @@ public class Util {
 	if err := os.WriteFile(binaryJar, []byte("bin"), 0o644); err != nil {
 		t.Fatalf("write binary jar: %v", err)
 	}
-	if err := os.WriteFile(sourceJar, []byte("src"), 0o644); err != nil {
-		t.Fatalf("write source jar: %v", err)
+	sourceFile, err := os.Create(sourceJar)
+	if err != nil {
+		t.Fatalf("create source jar: %v", err)
+	}
+	zipWriter := zip.NewWriter(sourceFile)
+	entry, err := zipWriter.Create("org/slf4j/Logger.java")
+	if err != nil {
+		_ = sourceFile.Close()
+		t.Fatalf("create source entry: %v", err)
+	}
+	if _, err := entry.Write([]byte("package org.slf4j; public interface Logger { void info(String msg); }")); err != nil {
+		_ = sourceFile.Close()
+		t.Fatalf("write source entry: %v", err)
+	}
+	if err := zipWriter.Close(); err != nil {
+		_ = sourceFile.Close()
+		t.Fatalf("close source zip writer: %v", err)
+	}
+	if err := sourceFile.Close(); err != nil {
+		t.Fatalf("close source jar: %v", err)
 	}
 
 	dbPath := filepath.Join(tmp, "index.db")
@@ -143,6 +162,22 @@ public class Util {
 	queryResult := mustCallTool(t, srv, "query_code", map[string]any{"project": projectName, "query": "Util helper", "limit": 5})
 	if intFromAny(queryResult["total"]) < 1 {
 		t.Fatalf("expected query_code total >= 1, got %#v", queryResult)
+	}
+
+	libraryQuery := mustCallTool(t, srv, "query_code", map[string]any{"project": projectName, "query": "Logger info", "scope": "libraries", "limit": 5})
+	if intFromAny(libraryQuery["total"]) < 1 {
+		t.Fatalf("expected library query_code total >= 1, got %#v", libraryQuery)
+	}
+	libraryResults, ok := libraryQuery["results"].([]any)
+	if !ok || len(libraryResults) == 0 {
+		t.Fatalf("expected non-empty library query results, got %#v", libraryQuery["results"])
+	}
+	firstLibraryResult, ok := libraryResults[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected first library result object, got %#v", libraryResults[0])
+	}
+	if firstLibraryResult["sourceOrigin"] != "library_source" {
+		t.Fatalf("expected sourceOrigin=library_source, got %#v", firstLibraryResult["sourceOrigin"])
 	}
 
 	symbolResult := mustCallTool(t, srv, "get_symbol_context", map[string]any{"project": projectName, "symbol": "ping"})
