@@ -1,0 +1,106 @@
+package indexer
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/bgtkv/jvmexus/internal/config"
+	"github.com/bgtkv/jvmexus/internal/gradle"
+	"github.com/bgtkv/jvmexus/internal/store"
+)
+
+func TestIndexProject_AttachesSourceJarFromCache(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("create repo dir: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(repo, "settings.gradle.kts"), []byte("include(\":app\")\n"), 0o644); err != nil {
+		t.Fatalf("write settings file: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, "app"), 0o755); err != nil {
+		t.Fatalf("create app module dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "app", "build.gradle.kts"), []byte(`
+dependencies {
+  implementation("org.slf4j:slf4j-api:2.0.13")
+}
+`), 0o644); err != nil {
+		t.Fatalf("write build file: %v", err)
+	}
+
+	gradleHome := filepath.Join(tmp, "gradle-home")
+	t.Setenv("GRADLE_USER_HOME", gradleHome)
+	cachePath := filepath.Join(gradleHome, "caches", "modules-2", "files-2.1", "org.slf4j", "slf4j-api", "2.0.13", "hash")
+	if err := os.MkdirAll(cachePath, 0o755); err != nil {
+		t.Fatalf("create gradle cache path: %v", err)
+	}
+	binaryJar := filepath.Join(cachePath, "slf4j-api-2.0.13.jar")
+	sourceJar := filepath.Join(cachePath, "slf4j-api-2.0.13-sources.jar")
+	if err := os.WriteFile(binaryJar, []byte("binary"), 0o644); err != nil {
+		t.Fatalf("write binary jar: %v", err)
+	}
+	if err := os.WriteFile(sourceJar, []byte("source"), 0o644); err != nil {
+		t.Fatalf("write source jar: %v", err)
+	}
+
+	dbPath := filepath.Join(tmp, "index.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate store: %v", err)
+	}
+
+	cfg := config.Config{
+		DatabasePath:           dbPath,
+		EmbeddingsProvider:     "local",
+		EmbeddingModelID:       "Snowflake/snowflake-arctic-embed-xs",
+		ModelCacheDir:          filepath.Join(tmp, "models"),
+		GradleTimeoutSeconds:   5,
+		FetchMissingSources:    true,
+		Offline:                true,
+		SourcesDownloadTimeout: 5,
+	}
+
+	ix := New(st, cfg)
+	result, err := ix.IndexProject(ctx, repo, Options{})
+	if err != nil {
+		t.Fatalf("index project: %v", err)
+	}
+
+	if result.ModuleCount != 2 {
+		t.Fatalf("expected 2 modules (root + app), got %d", result.ModuleCount)
+	}
+
+	project, err := st.FindProject(ctx, result.ProjectName)
+	if err != nil {
+		t.Fatalf("find project: %v", err)
+	}
+
+	deps, err := st.ListDependenciesByProjectID(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list dependencies: %v", err)
+	}
+	if len(deps) != 1 {
+		t.Fatalf("expected 1 dependency, got %d", len(deps))
+	}
+
+	dep := deps[0]
+	if dep.SourceStatus != gradle.SourceStatusAttached {
+		t.Fatalf("expected source status %q, got %q", gradle.SourceStatusAttached, dep.SourceStatus)
+	}
+	if dep.BinaryJarPath != binaryJar {
+		t.Fatalf("expected binary jar path %q, got %q", binaryJar, dep.BinaryJarPath)
+	}
+	if dep.SourceJarPath != sourceJar {
+		t.Fatalf("expected source jar path %q, got %q", sourceJar, dep.SourceJarPath)
+	}
+}
