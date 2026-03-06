@@ -147,4 +147,4 @@ Goal: make indexing practical for daily usage.
 Exit criteria:
 - Incremental indexing materially faster than full on repeat runs
 - End-to-end tests pass for single-module and multi-module fixtures
-- v1 release checklist complete
+- v1 release checklist complete (`planning/03-v1-release-checklist.md`)
