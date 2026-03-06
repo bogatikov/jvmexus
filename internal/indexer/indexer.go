@@ -15,7 +15,8 @@ import (
 )
 
 type Options struct {
-	Force bool
+	Force    bool
+	Progress func(message string)
 }
 
 type Result struct {
@@ -35,18 +36,27 @@ func New(s *store.Store, cfg config.Config) *Service {
 	return &Service{store: s, cfg: cfg}
 }
 
-func (s *Service) IndexProject(ctx context.Context, path string, _ Options) (Result, error) {
+func (s *Service) IndexProject(ctx context.Context, path string, opts Options) (Result, error) {
+	notify := func(message string) {
+		if opts.Progress != nil {
+			opts.Progress(message)
+		}
+	}
+
+	notify("Resolving project path")
 	absRoot, err := filepath.Abs(path)
 	if err != nil {
 		return Result{}, fmt.Errorf("resolve project path: %w", err)
 	}
 
+	notify("Upserting project in store")
 	projectName := filepath.Base(absRoot)
 	project, err := s.store.UpsertProject(ctx, projectName, absRoot)
 	if err != nil {
 		return Result{}, fmt.Errorf("upsert project: %w", err)
 	}
 
+	notify("Discovering Gradle modules")
 	modules, moduleWarnings, err := gradle.DiscoverModules(absRoot)
 	if err != nil {
 		return Result{}, fmt.Errorf("discover modules: %w", err)
@@ -55,20 +65,24 @@ func (s *Service) IndexProject(ctx context.Context, path string, _ Options) (Res
 	for _, m := range modules {
 		moduleRows = append(moduleRows, store.Module{Name: m.Name, Path: m.Path})
 	}
+	notify("Persisting modules")
 	if err := s.store.ReplaceModules(ctx, project.ID, moduleRows); err != nil {
 		return Result{}, fmt.Errorf("persist modules: %w", err)
 	}
 
+	notify("Extracting declared dependencies")
 	deps, dependencyWarnings, err := gradle.ExtractDeclaredDependencies(absRoot, modules)
 	if err != nil {
 		return Result{}, fmt.Errorf("extract dependencies: %w", err)
 	}
 
+	notify("Resolving dependencies via Gradle (this may take a while)")
 	deps, transitiveDeps, resolveWarnings := gradle.EnrichResolvedDependencies(ctx, absRoot, modules, deps, gradle.ResolveOptions{
 		GradleTimeoutSec: s.cfg.GradleTimeoutSeconds,
 		Offline:          s.cfg.Offline,
 	})
 
+	notify("Attaching source jars")
 	enrichedDirectDeps, sourceWarnings := gradle.AttachSourceJars(ctx, deps, gradle.SourceOptions{
 		FetchMissingSources: s.cfg.FetchMissingSources,
 		Offline:             s.cfg.Offline,
@@ -101,10 +115,12 @@ func (s *Service) IndexProject(ctx context.Context, path string, _ Options) (Res
 		})
 	}
 
+	notify("Persisting dependencies")
 	if err := s.store.ReplaceDependencies(ctx, project.ID, storeDeps); err != nil {
 		return Result{}, fmt.Errorf("persist dependencies: %w", err)
 	}
 
+	notify("Extracting symbols and references")
 	symbols, refs, symbolWarnings, err := extractProjectSymbols(absRoot)
 	if err != nil {
 		return Result{}, fmt.Errorf("extract symbols: %w", err)
@@ -122,6 +138,7 @@ func (s *Service) IndexProject(ctx context.Context, path string, _ Options) (Res
 			Signature: sym.Signature,
 		})
 	}
+	notify("Persisting symbols")
 	if err := s.store.ReplaceSymbols(ctx, project.ID, storeSymbols); err != nil {
 		return Result{}, fmt.Errorf("persist symbols: %w", err)
 	}
@@ -138,18 +155,22 @@ func (s *Service) IndexProject(ctx context.Context, path string, _ Options) (Res
 			Evidence:   ref.Evidence,
 		})
 	}
+	notify("Persisting symbol references")
 	if err := s.store.ReplaceSymbolReferences(ctx, project.ID, storeRefs); err != nil {
 		return Result{}, fmt.Errorf("persist symbol references: %w", err)
 	}
 
+	notify("Chunking project files for retrieval")
 	chunks, chunkWarnings, err := extractProjectChunks(absRoot)
 	if err != nil {
 		return Result{}, fmt.Errorf("extract chunks: %w", err)
 	}
+	notify("Persisting retrieval chunks")
 	if err := s.store.ReplaceChunks(ctx, project.ID, chunks); err != nil {
 		return Result{}, fmt.Errorf("persist chunks: %w", err)
 	}
 
+	notify("Counting source files")
 	fileCount, err := countSourceFiles(absRoot)
 	if err != nil {
 		return Result{}, fmt.Errorf("count source files: %w", err)
@@ -162,13 +183,15 @@ func (s *Service) IndexProject(ctx context.Context, path string, _ Options) (Res
 	warnings = append(warnings, symbolWarnings...)
 	warnings = append(warnings, chunkWarnings...)
 
-	return Result{
+	result := Result{
 		ProjectName: project.Name,
 		ProjectPath: project.RootPath,
 		ModuleCount: len(modules),
 		FileCount:   fileCount,
 		Warnings:    warnings,
-	}, nil
+	}
+	notify("Index complete")
+	return result, nil
 }
 
 func countSourceFiles(root string) (int, error) {

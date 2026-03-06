@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/bgtkv/jvmexus/internal/config"
 	"github.com/bgtkv/jvmexus/internal/indexer"
@@ -31,7 +32,12 @@ func main() {
 	}
 
 	ix := indexer.New(s, cfg)
-	result, err := ix.IndexProject(ctx, *path, indexer.Options{Force: *force})
+	result, err := ix.IndexProject(ctx, *path, indexer.Options{
+		Force: *force,
+		Progress: func(message string) {
+			fmt.Printf("[%s] %s\n", time.Now().Format("15:04:05"), message)
+		},
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "index failed: %v\n", err)
 		os.Exit(1)
