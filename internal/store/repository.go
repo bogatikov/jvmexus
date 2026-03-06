@@ -110,6 +110,32 @@ func (s *Store) ReplaceModules(ctx context.Context, projectID int64, modules []M
 	return nil
 }
 
+func (s *Store) ListModulesByProjectID(ctx context.Context, projectID int64) ([]Module, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT name, path
+		FROM modules
+		WHERE project_id = ?
+		ORDER BY CASE WHEN name = ':' THEN 0 ELSE 1 END, name ASC
+	`, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("query modules: %w", err)
+	}
+	defer rows.Close()
+
+	modules := make([]Module, 0, 16)
+	for rows.Next() {
+		var module Module
+		if err := rows.Scan(&module.Name, &module.Path); err != nil {
+			return nil, fmt.Errorf("scan module: %w", err)
+		}
+		modules = append(modules, module)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate modules: %w", err)
+	}
+	return modules, nil
+}
+
 func (s *Store) ReplaceDependencies(ctx context.Context, projectID int64, dependencies []Dependency) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -421,6 +447,36 @@ func (s *Store) ListOutgoingReferences(ctx context.Context, projectID int64, sym
 		return nil, fmt.Errorf("iterate outgoing refs: %w", err)
 	}
 	return refs, nil
+}
+
+func (s *Store) FindSymbolsByExactName(ctx context.Context, projectID int64, nameOrFQName string, limit int) ([]Symbol, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, file_path, language, name, fq_name, kind, start_line, end_line, ifnull(signature,'')
+		FROM symbols
+		WHERE project_id = ? AND (name = ? OR fq_name = ?)
+		ORDER BY CASE WHEN fq_name = ? THEN 0 ELSE 1 END, CASE WHEN kind IN ('Type','Interface') THEN 0 ELSE 1 END, name ASC
+		LIMIT ?
+	`, projectID, nameOrFQName, nameOrFQName, nameOrFQName, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query exact symbols: %w", err)
+	}
+	defer rows.Close()
+
+	result := make([]Symbol, 0, limit)
+	for rows.Next() {
+		var sym Symbol
+		if err := rows.Scan(&sym.ID, &sym.FilePath, &sym.Language, &sym.Name, &sym.FQName, &sym.Kind, &sym.StartLine, &sym.EndLine, &sym.Signature); err != nil {
+			return nil, fmt.Errorf("scan exact symbol: %w", err)
+		}
+		result = append(result, sym)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate exact symbols: %w", err)
+	}
+	return result, nil
 }
 
 func (s *Store) ListIncomingReferences(ctx context.Context, projectID int64, symbol Symbol, limit int) ([]SymbolReference, error) {

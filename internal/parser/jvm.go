@@ -48,10 +48,23 @@ func ParseFile(path string, content []byte) ([]Symbol, []Reference) {
 	if language == "" {
 		return nil, nil
 	}
+	if language == "java" {
+		if symbols, refs, ok := parseJavaTreeSitter(path, content); ok {
+			return dedupeSymbols(symbols), dedupeReferences(refs)
+		}
+	}
+	return parseHeuristic(path, content, language)
+}
+
+func parseHeuristic(path string, content []byte, language string) ([]Symbol, []Reference) {
 
 	lines := strings.Split(string(content), "\n")
 	packageName := parsePackage(lines, language)
 	baseName := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	ownerPrefix := baseName
+	if packageName != "" {
+		ownerPrefix = packageName + "." + baseName
+	}
 
 	symbols := make([]Symbol, 0, 16)
 	refs := make([]Reference, 0, 32)
@@ -74,7 +87,7 @@ func ParseFile(path string, content []byte) ([]Symbol, []Reference) {
 		}
 
 		symbols = append(symbols, parseTypeSymbol(line, language, packageName, path, lineNo)...)
-		fnSymbols := parseFunctionSymbol(line, language, packageName, path, lineNo)
+		fnSymbols := parseFunctionSymbol(line, language, packageName, ownerPrefix, path, lineNo)
 		symbols = append(symbols, fnSymbols...)
 		if len(fnSymbols) > 0 {
 			lastCallableByLine[lineNo] = fnSymbols[0].Name
@@ -144,23 +157,42 @@ func parseTypeSymbol(line, language, pkg, filePath string, lineNo int) []Symbol 
 	return nil
 }
 
-func parseFunctionSymbol(line, language, pkg, filePath string, lineNo int) []Symbol {
+func parseFunctionSymbol(line, language, pkg, ownerPrefix, filePath string, lineNo int) []Symbol {
 	if language == "java" {
 		if match := javaMethodRE.FindStringSubmatch(line); len(match) > 1 {
 			name := match[1]
 			if name == "if" || name == "for" || name == "while" || name == "switch" || name == "catch" {
 				return nil
 			}
-			return []Symbol{makeSymbol(name, pkg, "Method", language, filePath, lineNo, strings.TrimSpace(line))}
+			return []Symbol{makeCallableSymbol(name, pkg, ownerPrefix, "Method", language, filePath, lineNo, strings.TrimSpace(line))}
 		}
 	}
 	if language == "kotlin" {
 		if match := ktFunRE.FindStringSubmatch(line); len(match) > 1 {
 			name := match[1]
-			return []Symbol{makeSymbol(name, pkg, "Function", language, filePath, lineNo, strings.TrimSpace(line))}
+			return []Symbol{makeCallableSymbol(name, pkg, ownerPrefix, "Function", language, filePath, lineNo, strings.TrimSpace(line))}
 		}
 	}
 	return nil
+}
+
+func makeCallableSymbol(name, pkg, ownerPrefix, kind, language, filePath string, lineNo int, signature string) Symbol {
+	fq := name
+	if ownerPrefix != "" {
+		fq = ownerPrefix + "." + name
+	} else if pkg != "" {
+		fq = pkg + "." + name
+	}
+	return Symbol{
+		Name:      name,
+		FQName:    fq,
+		Kind:      kind,
+		Language:  language,
+		FilePath:  filePath,
+		StartLine: lineNo,
+		EndLine:   lineNo,
+		Signature: signature,
+	}
 }
 
 func parseCallReferences(filePath, line, owner string) []Reference {

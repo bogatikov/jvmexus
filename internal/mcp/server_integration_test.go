@@ -40,7 +40,16 @@ package com.example;
 import java.util.List;
 
 public class Bot {
-  public String ping() { return "pong"; }
+  public String ping() { return Util.helper(); }
+}
+`), 0o644); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "app", "src", "main", "java", "com", "example", "Util.java"), []byte(`
+package com.example;
+
+public class Util {
+  public static String helper() { return "pong"; }
 }
 `), 0o644); err != nil {
 		t.Fatalf("write source file: %v", err)
@@ -94,6 +103,14 @@ public class Bot {
 		t.Fatalf("expected sourceStats[%s] = 1, got %#v", gradle.SourceStatusAttached, stats[gradle.SourceStatusAttached])
 	}
 
+	buildGraph := mustCallTool(t, srv, "get_build_graph", map[string]any{"project": projectName})
+	if intFromAny(buildGraph["nodeCount"]) < 2 {
+		t.Fatalf("expected build graph nodeCount >= 2, got %#v", buildGraph["nodeCount"])
+	}
+	if intFromAny(buildGraph["edgeCount"]) < 1 {
+		t.Fatalf("expected build graph edgeCount >= 1, got %#v", buildGraph["edgeCount"])
+	}
+
 	resource := mustReadResource(t, srv, "jvminfo://project/"+projectName+"/dependencies")
 	if intFromAny(resource["total"]) != 1 {
 		t.Fatalf("resource total should be 1, got %#v", resource["total"])
@@ -110,9 +127,27 @@ public class Bot {
 		t.Fatalf("expected sourceStatus %q, got %#v", gradle.SourceStatusAttached, dep["sourceStatus"])
 	}
 
-	symbolResult := mustCallTool(t, srv, "get_symbol_context", map[string]any{"project": projectName, "symbol": "Bot"})
+	buildGraphResource := mustReadResource(t, srv, "jvminfo://project/"+projectName+"/build-graph")
+	if intFromAny(buildGraphResource["nodeCount"]) < 2 {
+		t.Fatalf("expected build-graph resource nodeCount >= 2, got %#v", buildGraphResource["nodeCount"])
+	}
+
+	symbolResult := mustCallTool(t, srv, "get_symbol_context", map[string]any{"project": projectName, "symbol": "ping"})
 	if intFromAny(symbolResult["count"]) < 1 {
-		t.Fatalf("expected at least one symbol context for Bot, got %#v", symbolResult)
+		t.Fatalf("expected at least one symbol context for ping, got %#v", symbolResult)
+	}
+
+	contexts, ok := symbolResult["contexts"].([]any)
+	if !ok || len(contexts) == 0 {
+		t.Fatalf("expected contexts array, got %#v", symbolResult["contexts"])
+	}
+	first, ok := contexts[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected context object, got %#v", contexts[0])
+	}
+	callees, ok := first["callees"].([]any)
+	if !ok || len(callees) == 0 {
+		t.Fatalf("expected resolved callees for ping, got %#v", first["callees"])
 	}
 }
 

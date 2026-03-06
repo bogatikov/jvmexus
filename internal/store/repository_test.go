@@ -120,6 +120,14 @@ func TestSymbolQueries_FindWithFilterAndOutgoingRefs(t *testing.T) {
 		t.Fatalf("expected 1 filtered symbol, got %d", len(filtered))
 	}
 
+	exact, err := st.FindSymbolsByExactName(ctx, project.ID, "com.example.sendMessage", 10)
+	if err != nil {
+		t.Fatalf("find exact symbol: %v", err)
+	}
+	if len(exact) != 1 {
+		t.Fatalf("expected 1 exact symbol match, got %d", len(exact))
+	}
+
 	outgoing, err := st.ListOutgoingReferences(ctx, project.ID, symbols[1], 20)
 	if err != nil {
 		t.Fatalf("list outgoing refs: %v", err)

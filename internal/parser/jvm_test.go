@@ -17,6 +17,16 @@ class BotService {
 	if len(symbols) < 2 {
 		t.Fatalf("expected at least 2 symbols, got %d", len(symbols))
 	}
+	foundCallableFQ := false
+	for _, sym := range symbols {
+		if sym.Name == "sendMessage" && sym.FQName == "com.example.demo.BotService.sendMessage" {
+			foundCallableFQ = true
+			break
+		}
+	}
+	if !foundCallableFQ {
+		t.Fatalf("expected callable fq name with owner prefix, symbols=%#v", symbols)
+	}
 	if len(refs) < 2 {
 		t.Fatalf("expected at least 2 references (import + call), got %d", len(refs))
 	}
@@ -56,6 +66,16 @@ public class Greeter {
 	symbols, refs := ParseFile("src/main/java/com/example/demo/Greeter.java", content)
 	if len(symbols) < 2 {
 		t.Fatalf("expected at least 2 symbols, got %d", len(symbols))
+	}
+	foundJavaMethodFQ := false
+	for _, sym := range symbols {
+		if sym.Name == "greet" && sym.FQName == "com.example.demo.Greeter.greet" {
+			foundJavaMethodFQ = true
+			break
+		}
+	}
+	if !foundJavaMethodFQ {
+		t.Fatalf("expected java method fq name with owner prefix, symbols=%#v", symbols)
 	}
 	if len(refs) != 1 {
 		t.Fatalf("expected 1 import reference, got %d", len(refs))

@@ -25,7 +25,7 @@ func NewServer(cfg config.Config, st *store.Store) *server.MCPServer {
 	registerListProjectsTool(srv, st)
 	registerIndexProjectTool(srv, st, cfg)
 	registerGetDependenciesTool(srv, st)
-	registerGetBuildGraphTool(srv)
+	registerGetBuildGraphTool(srv, st)
 	registerQueryCodeTool(srv)
 	registerGetSymbolContextTool(srv, st)
 	registerResources(srv, st)
@@ -133,11 +133,44 @@ func registerResources(srv *server.MCPServer, st *store.Store) {
 			},
 		}, nil
 	})
+
+	buildGraphTemplate := mcp.NewResourceTemplate(
+		"jvminfo://project/{name}/build-graph",
+		"Project Build Graph",
+		mcp.WithTemplateDescription("Module/dependency build graph for the project"),
+		mcp.WithTemplateMIMEType("application/json"),
+	)
+	srv.AddResourceTemplate(buildGraphTemplate, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+		name := templateValue(request.Params.URI, buildGraphURI)
+		if name == "" {
+			return nil, fmt.Errorf("invalid build-graph uri: %s", request.Params.URI)
+		}
+		project, err := st.FindProject(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		graph, err := buildGraphPayload(ctx, st, project, false)
+		if err != nil {
+			return nil, err
+		}
+		payload, err := toJSON(graph)
+		if err != nil {
+			return nil, err
+		}
+		return []mcp.ResourceContents{
+			mcp.TextResourceContents{
+				URI:      request.Params.URI,
+				MIMEType: "application/json",
+				Text:     payload,
+			},
+		}, nil
+	})
 }
 
 var (
-	summaryURI = regexp.MustCompile(`^jvminfo://project/([^/]+)/summary$`)
-	depsURI    = regexp.MustCompile(`^jvminfo://project/([^/]+)/dependencies$`)
+	summaryURI    = regexp.MustCompile(`^jvminfo://project/([^/]+)/summary$`)
+	depsURI       = regexp.MustCompile(`^jvminfo://project/([^/]+)/dependencies$`)
+	buildGraphURI = regexp.MustCompile(`^jvminfo://project/([^/]+)/build-graph$`)
 )
 
 func templateValue(uri string, re *regexp.Regexp) string {
@@ -156,24 +189,98 @@ func toJSON(value any) (string, error) {
 	return string(raw), nil
 }
 
-func registerGetBuildGraphTool(srv *server.MCPServer) {
+func registerGetBuildGraphTool(srv *server.MCPServer, st *store.Store) {
 	tool := mcp.NewTool(
 		"get_build_graph",
-		mcp.WithDescription("Return build graph nodes/edges (placeholder for upcoming phase)"),
+		mcp.WithDescription("Return module/dependency build graph for a project"),
 		mcp.WithString("project", mcp.Required(), mcp.Description("Project name or root path")),
+		mcp.WithBoolean("includeTransitive", mcp.Description("Include transitive dependencies in graph")),
 	)
-	srv.AddTool(tool, func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	srv.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		projectArg, err := req.RequireString("project")
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		payload := map[string]any{
-			"project": projectArg,
-			"status":  "not_implemented",
-			"phase":   "Phase 4 - Build Graph and Cross-Graph Linking",
+		project, err := st.FindProject(ctx, projectArg)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		includeTransitive := req.GetBool("includeTransitive", false)
+		payload, err := buildGraphPayload(ctx, st, project, includeTransitive)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("build graph: %v", err)), nil
 		}
 		return jsonToolResult(payload)
 	})
+}
+
+func buildGraphPayload(ctx context.Context, st *store.Store, project store.Project, includeTransitive bool) (map[string]any, error) {
+	modules, err := st.ListModulesByProjectID(ctx, project.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list modules: %w", err)
+	}
+	dependencies, err := st.ListDependenciesByProjectIDWithMode(ctx, project.ID, includeTransitive)
+	if err != nil {
+		return nil, fmt.Errorf("list dependencies: %w", err)
+	}
+
+	type node struct {
+		ID       string         `json:"id"`
+		NodeType string         `json:"nodeType"`
+		Label    string         `json:"label"`
+		Metadata map[string]any `json:"metadata,omitempty"`
+	}
+	type edge struct {
+		From     string         `json:"from"`
+		To       string         `json:"to"`
+		EdgeType string         `json:"edgeType"`
+		Metadata map[string]any `json:"metadata,omitempty"`
+	}
+
+	nodes := make([]node, 0, len(modules)+len(dependencies)+1)
+	edges := make([]edge, 0, len(dependencies))
+	nodeSeen := map[string]struct{}{}
+
+	projectNodeID := "project:" + project.Name
+	nodes = append(nodes, node{ID: projectNodeID, NodeType: "project", Label: project.Name})
+	nodeSeen[projectNodeID] = struct{}{}
+
+	for _, module := range modules {
+		moduleID := "module:" + module.Name
+		if _, ok := nodeSeen[moduleID]; !ok {
+			nodeSeen[moduleID] = struct{}{}
+			nodes = append(nodes, node{ID: moduleID, NodeType: "module", Label: module.Name, Metadata: map[string]any{"path": module.Path}})
+		}
+		edges = append(edges, edge{From: projectNodeID, To: moduleID, EdgeType: "CONTAINS"})
+	}
+
+	for _, dep := range dependencies {
+		depLabel := dep.GroupID + ":" + dep.ArtifactID
+		if dep.Version != "" {
+			depLabel += ":" + dep.Version
+		}
+		depID := "dependency:" + depLabel + "|" + dep.Kind + "|" + dep.Scope
+		if _, ok := nodeSeen[depID]; !ok {
+			nodeSeen[depID] = struct{}{}
+			nodes = append(nodes, node{
+				ID:       depID,
+				NodeType: "dependency",
+				Label:    depLabel,
+				Metadata: map[string]any{"kind": dep.Kind, "scope": dep.Scope, "type": dep.Type, "resolutionType": dep.ResolutionType, "sourceStatus": dep.SourceStatus},
+			})
+		}
+		moduleID := "module:" + dep.ModuleName
+		edges = append(edges, edge{From: moduleID, To: depID, EdgeType: "DEPENDS_ON", Metadata: map[string]any{"scope": dep.Scope, "kind": dep.Kind}})
+	}
+
+	return map[string]any{
+		"project":           project,
+		"includeTransitive": includeTransitive,
+		"nodeCount":         len(nodes),
+		"edgeCount":         len(edges),
+		"nodes":             nodes,
+		"edges":             edges,
+	}, nil
 }
 
 func registerQueryCodeTool(srv *server.MCPServer) {
@@ -234,9 +341,13 @@ func registerGetSymbolContextTool(srv *server.MCPServer, st *store.Store) {
 		}
 
 		type symbolContext struct {
-			Symbol   store.Symbol            `json:"symbol"`
-			Incoming []store.SymbolReference `json:"incoming"`
-			Outgoing []store.SymbolReference `json:"outgoing"`
+			Symbol                store.Symbol            `json:"symbol"`
+			Incoming              []store.SymbolReference `json:"incoming"`
+			Outgoing              []store.SymbolReference `json:"outgoing"`
+			Callers               []store.Symbol          `json:"callers"`
+			Callees               []store.Symbol          `json:"callees"`
+			ImportedSymbols       []store.Symbol          `json:"importedSymbols"`
+			UnresolvedCallTargets []string                `json:"unresolvedCallTargets"`
 		}
 		contexts := make([]symbolContext, 0, len(symbols))
 		for _, sym := range symbols {
@@ -248,7 +359,26 @@ func registerGetSymbolContextTool(srv *server.MCPServer, st *store.Store) {
 			if outgoingErr != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("load outgoing references for %s: %v", sym.Name, outgoingErr)), nil
 			}
-			contexts = append(contexts, symbolContext{Symbol: sym, Incoming: incoming, Outgoing: outgoing})
+
+			callers, resolveIncomingErr := resolveIncomingCallers(ctx, st, project.ID, incoming)
+			if resolveIncomingErr != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("resolve callers for %s: %v", sym.Name, resolveIncomingErr)), nil
+			}
+
+			callees, importedSymbols, unresolvedCalls, resolveOutgoingErr := resolveOutgoingTargets(ctx, st, project.ID, outgoing)
+			if resolveOutgoingErr != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("resolve outgoing targets for %s: %v", sym.Name, resolveOutgoingErr)), nil
+			}
+
+			contexts = append(contexts, symbolContext{
+				Symbol:                sym,
+				Incoming:              incoming,
+				Outgoing:              outgoing,
+				Callers:               callers,
+				Callees:               callees,
+				ImportedSymbols:       importedSymbols,
+				UnresolvedCallTargets: unresolvedCalls,
+			})
 		}
 
 		disambiguationNeeded := len(contexts) > 1
@@ -264,6 +394,82 @@ func registerGetSymbolContextTool(srv *server.MCPServer, st *store.Store) {
 		}
 		return jsonToolResult(payload)
 	})
+}
+
+func resolveIncomingCallers(ctx context.Context, st *store.Store, projectID int64, incoming []store.SymbolReference) ([]store.Symbol, error) {
+	callers := make([]store.Symbol, 0, 16)
+	seen := map[string]struct{}{}
+	for _, ref := range incoming {
+		if ref.RefType != "CALLS" {
+			continue
+		}
+		candidates, err := st.FindSymbolsByExactName(ctx, projectID, ref.FromName, 5)
+		if err != nil {
+			return nil, err
+		}
+		for _, candidate := range candidates {
+			key := candidate.FQName + "|" + candidate.FilePath
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			callers = append(callers, candidate)
+		}
+	}
+	return callers, nil
+}
+
+func resolveOutgoingTargets(ctx context.Context, st *store.Store, projectID int64, outgoing []store.SymbolReference) ([]store.Symbol, []store.Symbol, []string, error) {
+	callees := make([]store.Symbol, 0, 16)
+	imports := make([]store.Symbol, 0, 16)
+	unresolved := make([]string, 0, 16)
+	seenCallee := map[string]struct{}{}
+	seenImport := map[string]struct{}{}
+	seenUnresolved := map[string]struct{}{}
+
+	for _, ref := range outgoing {
+		if ref.RefType != "CALLS" && ref.RefType != "IMPORTS" {
+			continue
+		}
+
+		query := ref.ToName
+		if ref.ToFQName != "" {
+			query = ref.ToFQName
+		}
+		candidates, err := st.FindSymbolsByExactName(ctx, projectID, query, 10)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		if len(candidates) == 0 {
+			if ref.RefType == "CALLS" {
+				if _, ok := seenUnresolved[ref.ToName]; !ok {
+					seenUnresolved[ref.ToName] = struct{}{}
+					unresolved = append(unresolved, ref.ToName)
+				}
+			}
+			continue
+		}
+
+		for _, candidate := range candidates {
+			key := candidate.FQName + "|" + candidate.FilePath
+			if ref.RefType == "CALLS" {
+				if _, ok := seenCallee[key]; ok {
+					continue
+				}
+				seenCallee[key] = struct{}{}
+				callees = append(callees, candidate)
+				continue
+			}
+			if _, ok := seenImport[key]; ok {
+				continue
+			}
+			seenImport[key] = struct{}{}
+			imports = append(imports, candidate)
+		}
+	}
+
+	return callees, imports, unresolved, nil
 }
 
 func registerListProjectsTool(srv *server.MCPServer, st *store.Store) {
