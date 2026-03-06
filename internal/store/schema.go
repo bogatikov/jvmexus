@@ -64,6 +64,22 @@ CREATE TABLE IF NOT EXISTS symbols (
 CREATE INDEX IF NOT EXISTS idx_symbols_project_name ON symbols(project_id, name);
 CREATE INDEX IF NOT EXISTS idx_symbols_project_fq ON symbols(project_id, fq_name);
 
+CREATE TABLE IF NOT EXISTS indexed_files (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  file_path TEXT NOT NULL,
+  file_kind TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  mtime_unix INTEGER NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(project_id, file_path),
+  FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_indexed_files_project ON indexed_files(project_id);
+
 CREATE TABLE IF NOT EXISTS symbol_refs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id INTEGER NOT NULL,

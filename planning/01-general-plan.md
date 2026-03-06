@@ -30,11 +30,27 @@ Build an MCP server in Go that provides deep project intelligence for JVM repos 
 ## MCP Surface (MVP)
 ### Tools
 1. `list_projects` - list indexed projects
-2. `index_project` - index/update a project path
+2. `index_project` - index/update a project path; returns indexing mode and file diff stats (`mode`, `changedFiles`, `deletedFiles`, `skippedFiles`)
 3. `get_dependencies` - declared/resolved deps + binary/source jar attachment metadata
 4. `get_build_graph` - modules/tasks/config edges
 5. `query_code` - hybrid RAG search over code/build chunks
 6. `get_symbol_context` - symbol, callers/callees/importers (best effort)
+
+Example `index_project` response shape:
+
+```json
+{
+  "projectName": "sample-repo",
+  "projectPath": "/abs/path/sample-repo",
+  "moduleCount": 2,
+  "fileCount": 24,
+  "mode": "incremental",
+  "changedFiles": 1,
+  "deletedFiles": 0,
+  "skippedFiles": 23,
+  "warnings": []
+}
+```
 
 ### Resources
 - `jvminfo://projects`

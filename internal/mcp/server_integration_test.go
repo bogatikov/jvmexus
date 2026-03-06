@@ -88,6 +88,14 @@ public class Util {
 	if indexResult["projectName"] == "" {
 		t.Fatalf("index response missing projectName: %#v", indexResult)
 	}
+	if mode, _ := indexResult["mode"].(string); mode == "" {
+		t.Fatalf("index response missing mode: %#v", indexResult)
+	}
+	for _, key := range []string{"changedFiles", "deletedFiles", "skippedFiles"} {
+		if _, ok := indexResult[key]; !ok {
+			t.Fatalf("index response missing %s: %#v", key, indexResult)
+		}
+	}
 
 	projectName := filepath.Base(repo)
 	depsResult := mustCallTool(t, srv, "get_dependencies", map[string]any{"project": projectName})

@@ -72,6 +72,14 @@ type Chunk struct {
 	Score      float64 `json:"score,omitempty"`
 }
 
+type IndexedFile struct {
+	FilePath  string `json:"filePath"`
+	FileKind  string `json:"fileKind"`
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"sizeBytes"`
+	MtimeUnix int64  `json:"mtimeUnix"`
+}
+
 func (s *Store) UpsertProject(ctx context.Context, name, rootPath string) (Project, error) {
 	if _, err := s.db.ExecContext(ctx, `
 		INSERT INTO projects(name, root_path)
@@ -340,6 +348,40 @@ func (s *Store) ReplaceChunks(ctx context.Context, projectID int64, chunks []Chu
 	return nil
 }
 
+func (s *Store) InsertChunks(ctx context.Context, projectID int64, chunks []Chunk) error {
+	if len(chunks) == 0 {
+		return nil
+	}
+	stmt, err := s.db.PrepareContext(ctx, `
+		INSERT INTO chunks(project_id, file_path, language, chunk_type, chunk_index, symbol_name, text, token_count)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare insert chunks: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, chunk := range chunks {
+		if _, err := stmt.ExecContext(ctx,
+			projectID,
+			chunk.FilePath,
+			chunk.Language,
+			chunk.ChunkType,
+			chunk.ChunkIndex,
+			nullable(chunk.SymbolName),
+			chunk.Text,
+			chunk.TokenCount,
+		); err != nil {
+			return fmt.Errorf("insert chunk %s#%d: %w", chunk.FilePath, chunk.ChunkIndex, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) DeleteChunksByFilePaths(ctx context.Context, projectID int64, filePaths []string) error {
+	return s.deleteByFilePaths(ctx, "chunks", "file_path", projectID, filePaths)
+}
+
 func (s *Store) SearchChunks(ctx context.Context, projectID int64, query string, limit int) ([]Chunk, error) {
 	if limit <= 0 {
 		limit = 10
@@ -441,6 +483,41 @@ func (s *Store) ReplaceSymbols(ctx context.Context, projectID int64, symbols []S
 	return nil
 }
 
+func (s *Store) InsertSymbols(ctx context.Context, projectID int64, symbols []Symbol) error {
+	if len(symbols) == 0 {
+		return nil
+	}
+	stmt, err := s.db.PrepareContext(ctx, `
+		INSERT INTO symbols(project_id, file_path, language, name, fq_name, kind, start_line, end_line, signature)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare insert symbols: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, sym := range symbols {
+		if _, err := stmt.ExecContext(ctx,
+			projectID,
+			sym.FilePath,
+			sym.Language,
+			sym.Name,
+			sym.FQName,
+			sym.Kind,
+			sym.StartLine,
+			sym.EndLine,
+			nullable(sym.Signature),
+		); err != nil {
+			return fmt.Errorf("insert symbol %s: %w", sym.Name, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) DeleteSymbolsByFilePaths(ctx context.Context, projectID int64, filePaths []string) error {
+	return s.deleteByFilePaths(ctx, "symbols", "file_path", projectID, filePaths)
+}
+
 func (s *Store) ReplaceSymbolReferences(ctx context.Context, projectID int64, refs []SymbolReference) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -478,6 +555,124 @@ func (s *Store) ReplaceSymbolReferences(ctx context.Context, projectID int64, re
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit refs: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) InsertSymbolReferences(ctx context.Context, projectID int64, refs []SymbolReference) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	stmt, err := s.db.PrepareContext(ctx, `
+		INSERT INTO symbol_refs(project_id, from_name, from_file_path, to_name, to_fq_name, ref_type, confidence, evidence)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare insert refs: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, ref := range refs {
+		if _, err := stmt.ExecContext(ctx,
+			projectID,
+			ref.FromName,
+			ref.FromFile,
+			ref.ToName,
+			nullable(ref.ToFQName),
+			ref.RefType,
+			ref.Confidence,
+			nullable(ref.Evidence),
+		); err != nil {
+			return fmt.Errorf("insert symbol ref %s->%s: %w", ref.FromName, ref.ToName, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) DeleteSymbolReferencesByFromFilePaths(ctx context.Context, projectID int64, filePaths []string) error {
+	return s.deleteByFilePaths(ctx, "symbol_refs", "from_file_path", projectID, filePaths)
+}
+
+func (s *Store) ListIndexedFilesByProjectID(ctx context.Context, projectID int64) ([]IndexedFile, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT file_path, file_kind, sha256, size_bytes, mtime_unix
+		FROM indexed_files
+		WHERE project_id = ?
+		ORDER BY file_path ASC
+	`, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("query indexed files: %w", err)
+	}
+	defer rows.Close()
+
+	files := make([]IndexedFile, 0, 128)
+	for rows.Next() {
+		var f IndexedFile
+		if err := rows.Scan(&f.FilePath, &f.FileKind, &f.SHA256, &f.SizeBytes, &f.MtimeUnix); err != nil {
+			return nil, fmt.Errorf("scan indexed file: %w", err)
+		}
+		files = append(files, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate indexed files: %w", err)
+	}
+	return files, nil
+}
+
+func (s *Store) ReplaceIndexedFiles(ctx context.Context, projectID int64, files []IndexedFile) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx replace indexed files: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM indexed_files WHERE project_id = ?`, projectID); err != nil {
+		return fmt.Errorf("delete indexed files: %w", err)
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO indexed_files(project_id, file_path, file_kind, sha256, size_bytes, mtime_unix)
+		VALUES(?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare insert indexed files: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, file := range files {
+		if _, err := stmt.ExecContext(ctx,
+			projectID,
+			file.FilePath,
+			file.FileKind,
+			file.SHA256,
+			file.SizeBytes,
+			file.MtimeUnix,
+		); err != nil {
+			return fmt.Errorf("insert indexed file %s: %w", file.FilePath, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit indexed files: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) deleteByFilePaths(ctx context.Context, tableName, columnName string, projectID int64, filePaths []string) error {
+	if len(filePaths) == 0 {
+		return nil
+	}
+
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(filePaths)), ",")
+	query := fmt.Sprintf("DELETE FROM %s WHERE project_id = ? AND %s IN (%s)", tableName, columnName, placeholders)
+	args := make([]any, 0, len(filePaths)+1)
+	args = append(args, projectID)
+	for _, p := range filePaths {
+		args = append(args, p)
+	}
+
+	if _, err := s.db.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("delete %s by paths: %w", tableName, err)
 	}
 	return nil
 }

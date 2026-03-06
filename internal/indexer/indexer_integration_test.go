@@ -104,3 +104,202 @@ dependencies {
 		t.Fatalf("expected source jar path %q, got %q", sourceJar, dep.SourceJarPath)
 	}
 }
+
+func TestIndexProject_SmartIncrementalSourceOnlyChanges(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(filepath.Join(repo, "app", "src", "main", "java", "com", "example"), 0o755); err != nil {
+		t.Fatalf("create source dir: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(repo, "settings.gradle.kts"), []byte("include(\":app\")\n"), 0o644); err != nil {
+		t.Fatalf("write settings file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "app", "build.gradle.kts"), []byte(`
+dependencies {
+  implementation("org.slf4j:slf4j-api:2.0.13")
+}
+`), 0o644); err != nil {
+		t.Fatalf("write build file: %v", err)
+	}
+	javaFile := filepath.Join(repo, "app", "src", "main", "java", "com", "example", "Bot.java")
+	if err := os.WriteFile(javaFile, []byte(`
+package com.example;
+public class Bot {
+  String ping() { return "pong"; }
+}
+`), 0o644); err != nil {
+		t.Fatalf("write java file: %v", err)
+	}
+
+	gradleHome := filepath.Join(tmp, "gradle-home")
+	t.Setenv("GRADLE_USER_HOME", gradleHome)
+	cachePath := filepath.Join(gradleHome, "caches", "modules-2", "files-2.1", "org.slf4j", "slf4j-api", "2.0.13", "hash")
+	if err := os.MkdirAll(cachePath, 0o755); err != nil {
+		t.Fatalf("create gradle cache path: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cachePath, "slf4j-api-2.0.13.jar"), []byte("binary"), 0o644); err != nil {
+		t.Fatalf("write binary jar: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cachePath, "slf4j-api-2.0.13-sources.jar"), []byte("source"), 0o644); err != nil {
+		t.Fatalf("write source jar: %v", err)
+	}
+
+	dbPath := filepath.Join(tmp, "index.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate store: %v", err)
+	}
+
+	cfg := config.Config{
+		DatabasePath:           dbPath,
+		EmbeddingsProvider:     "local",
+		EmbeddingModelID:       "Snowflake/snowflake-arctic-embed-xs",
+		ModelCacheDir:          filepath.Join(tmp, "models"),
+		GradleTimeoutSeconds:   5,
+		FetchMissingSources:    true,
+		Offline:                true,
+		SourcesDownloadTimeout: 5,
+	}
+
+	ix := New(st, cfg)
+	first, err := ix.IndexProject(ctx, repo, Options{})
+	if err != nil {
+		t.Fatalf("first index project: %v", err)
+	}
+	if first.Mode != "full" {
+		t.Fatalf("expected first indexing mode full, got %q", first.Mode)
+	}
+
+	if err := os.WriteFile(javaFile, []byte(`
+package com.example;
+public class Bot {
+  String ping() { return helper(); }
+  String helper() { return "pong"; }
+}
+`), 0o644); err != nil {
+		t.Fatalf("rewrite java file: %v", err)
+	}
+
+	second, err := ix.IndexProject(ctx, repo, Options{})
+	if err != nil {
+		t.Fatalf("second index project: %v", err)
+	}
+	if second.Mode != "incremental" {
+		t.Fatalf("expected second indexing mode incremental, got %q", second.Mode)
+	}
+	if second.ChangedFiles < 1 {
+		t.Fatalf("expected changed files to be > 0, got %d", second.ChangedFiles)
+	}
+
+	project, err := st.FindProject(ctx, first.ProjectName)
+	if err != nil {
+		t.Fatalf("find project: %v", err)
+	}
+	symbols, err := st.FindSymbolsWithFilter(ctx, project.ID, "helper", "Bot.java", 10)
+	if err != nil {
+		t.Fatalf("find helper symbol: %v", err)
+	}
+	if len(symbols) == 0 {
+		t.Fatalf("expected helper symbol after incremental update")
+	}
+}
+
+func TestIndexProject_BuildFileChangeForcesFullReindex(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(filepath.Join(repo, "app", "src", "main", "java", "com", "example"), 0o755); err != nil {
+		t.Fatalf("create source dir: %v", err)
+	}
+
+	buildPath := filepath.Join(repo, "app", "build.gradle.kts")
+	if err := os.WriteFile(filepath.Join(repo, "settings.gradle.kts"), []byte("include(\":app\")\n"), 0o644); err != nil {
+		t.Fatalf("write settings file: %v", err)
+	}
+	if err := os.WriteFile(buildPath, []byte(`
+dependencies {
+  implementation("org.slf4j:slf4j-api:2.0.13")
+}
+`), 0o644); err != nil {
+		t.Fatalf("write build file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "app", "src", "main", "java", "com", "example", "Bot.java"), []byte(`
+package com.example;
+public class Bot {
+  String ping() { return "pong"; }
+}
+`), 0o644); err != nil {
+		t.Fatalf("write java file: %v", err)
+	}
+
+	gradleHome := filepath.Join(tmp, "gradle-home")
+	t.Setenv("GRADLE_USER_HOME", gradleHome)
+	cachePath := filepath.Join(gradleHome, "caches", "modules-2", "files-2.1", "org.slf4j", "slf4j-api", "2.0.13", "hash")
+	if err := os.MkdirAll(cachePath, 0o755); err != nil {
+		t.Fatalf("create gradle cache path: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cachePath, "slf4j-api-2.0.13.jar"), []byte("binary"), 0o644); err != nil {
+		t.Fatalf("write binary jar: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cachePath, "slf4j-api-2.0.13-sources.jar"), []byte("source"), 0o644); err != nil {
+		t.Fatalf("write source jar: %v", err)
+	}
+
+	dbPath := filepath.Join(tmp, "index.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate store: %v", err)
+	}
+
+	cfg := config.Config{
+		DatabasePath:           dbPath,
+		EmbeddingsProvider:     "local",
+		EmbeddingModelID:       "Snowflake/snowflake-arctic-embed-xs",
+		ModelCacheDir:          filepath.Join(tmp, "models"),
+		GradleTimeoutSeconds:   5,
+		FetchMissingSources:    true,
+		Offline:                true,
+		SourcesDownloadTimeout: 5,
+	}
+
+	ix := New(st, cfg)
+	first, err := ix.IndexProject(ctx, repo, Options{})
+	if err != nil {
+		t.Fatalf("first index project: %v", err)
+	}
+	if first.Mode != "full" {
+		t.Fatalf("expected first indexing mode full, got %q", first.Mode)
+	}
+
+	if err := os.WriteFile(buildPath, []byte(`
+dependencies {
+  implementation("org.slf4j:slf4j-api:2.0.13")
+  testImplementation("junit:junit:4.13.2")
+}
+`), 0o644); err != nil {
+		t.Fatalf("rewrite build file: %v", err)
+	}
+
+	second, err := ix.IndexProject(ctx, repo, Options{})
+	if err != nil {
+		t.Fatalf("second index project: %v", err)
+	}
+	if second.Mode != "full" {
+		t.Fatalf("expected second indexing mode full after build change, got %q", second.Mode)
+	}
+	if second.ChangedFiles < 1 {
+		t.Fatalf("expected changed files to be > 0, got %d", second.ChangedFiles)
+	}
+}
