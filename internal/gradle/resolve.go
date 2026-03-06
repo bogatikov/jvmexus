@@ -3,11 +3,13 @@ package gradle
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,6 +17,8 @@ import (
 type ResolveOptions struct {
 	GradleTimeoutSec int
 	Offline          bool
+	RetryCount       int
+	RetryBackoffMS   int
 }
 
 var resolvedDepLineRE = regexp.MustCompile(`(?m)([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):([^\s\(]+)(?:\s+->\s+([^\s\(]+))?`)
@@ -33,6 +37,12 @@ func EnrichResolvedDependencies(ctx context.Context, repoRoot string, modules []
 	}
 	if opts.GradleTimeoutSec <= 0 {
 		opts.GradleTimeoutSec = 120
+	}
+	if opts.RetryCount < 0 {
+		opts.RetryCount = 0
+	}
+	if opts.RetryBackoffMS <= 0 {
+		opts.RetryBackoffMS = 300
 	}
 
 	gradlewPath := filepath.Join(repoRoot, "gradlew")
@@ -57,9 +67,9 @@ func EnrichResolvedDependencies(ctx context.Context, repoRoot string, modules []
 		}
 
 		for _, configName := range configs {
-			stdout, stderr, err := runGradleDependencies(ctx, repoRoot, task, configName, opts.GradleTimeoutSec)
+			stdout, stderr, attempts, err := runGradleDependenciesWithRetry(ctx, repoRoot, task, configName, opts)
 			if err != nil {
-				warnings = append(warnings, fmt.Sprintf("gradle %s --configuration %s failed: %v (%s)", task, configName, err, strings.TrimSpace(stderr)))
+				warnings = append(warnings, formatGradleResolveWarning(task, configName, err, stderr, attempts))
 				continue
 			}
 			found := parseResolvedVersionMap(stdout)
@@ -126,6 +136,40 @@ func EnrichResolvedDependencies(ctx context.Context, repoRoot string, modules []
 	return updated, transitiveList, dedupeWarnings(warnings)
 }
 
+func runGradleDependenciesWithRetry(ctx context.Context, repoRoot, task, configuration string, opts ResolveOptions) (string, string, int, error) {
+	maxAttempts := opts.RetryCount + 1
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	var lastStdout string
+	var lastStderr string
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		stdout, stderr, err := runGradleDependencies(ctx, repoRoot, task, configuration, opts.GradleTimeoutSec)
+		if err == nil {
+			return stdout, stderr, attempt, nil
+		}
+
+		lastStdout = stdout
+		lastStderr = stderr
+		lastErr = err
+		if attempt == maxAttempts || !isRetryableGradleError(err, stderr) {
+			break
+		}
+
+		backoff := time.Duration(opts.RetryBackoffMS*attempt) * time.Millisecond
+		select {
+		case <-ctx.Done():
+			return lastStdout, lastStderr, attempt, ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+
+	return lastStdout, lastStderr, maxAttempts, lastErr
+}
+
 func runGradleDependencies(ctx context.Context, repoRoot, task, configuration string, timeoutSec int) (string, string, error) {
 	commandCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
@@ -143,8 +187,109 @@ func runGradleDependencies(ctx context.Context, repoRoot, task, configuration st
 	if commandCtx.Err() == context.DeadlineExceeded {
 		return stdout.String(), stderr.String(), fmt.Errorf("timed out after %ds", timeoutSec)
 	}
+	if err != nil {
+		if exitErr := new(exec.ExitError); errors.As(err, &exitErr) {
+			return stdout.String(), stderr.String(), fmt.Errorf("exit code %d", exitErr.ExitCode())
+		}
+	}
 
 	return stdout.String(), stderr.String(), err
+}
+
+func formatGradleResolveWarning(task, configuration string, err error, stderr string, attempts int) string {
+	class := classifyGradleFailure(err, stderr)
+	stderrSummary := compactStderr(stderr)
+	warning := fmt.Sprintf("gradle %s --configuration %s failed (%s) after %d attempt(s): %v", task, configuration, class, attempts, err)
+	if stderrSummary != "" {
+		warning += " | stderr=" + stderrSummary
+	}
+	return warning
+}
+
+func classifyGradleFailure(err error, stderr string) string {
+	if err == nil {
+		return "unknown"
+	}
+	lowerErr := strings.ToLower(err.Error())
+	lowerStderr := strings.ToLower(stderr)
+	combined := lowerErr + " " + lowerStderr
+
+	if strings.Contains(lowerErr, "timed out") || strings.Contains(combined, "deadline exceeded") {
+		return "timeout"
+	}
+	if containsAny(combined, "unauthorized", "forbidden", "authentication", "credentials", "401", "403") {
+		return "auth"
+	}
+	if containsAny(combined,
+		"connection refused",
+		"network is unreachable",
+		"unknown host",
+		"could not resolve",
+		"read timed out",
+		"connect timed out",
+		"connection reset",
+		"tls handshake timeout",
+	) {
+		return "network"
+	}
+	if containsAny(combined, "repo", "repository", "artifact", "maven") {
+		return "repository"
+	}
+	if code := parseExitCode(lowerErr); code != 0 {
+		return "execution"
+	}
+	return "execution"
+}
+
+func compactStderr(stderr string) string {
+	trimmed := strings.TrimSpace(stderr)
+	if trimmed == "" {
+		return ""
+	}
+	trimmed = strings.Join(strings.Fields(trimmed), " ")
+	const maxLen = 240
+	if len(trimmed) > maxLen {
+		return trimmed[:maxLen] + "..."
+	}
+	return trimmed
+}
+
+func isRetryableGradleError(err error, stderr string) bool {
+	if err == nil {
+		return false
+	}
+	class := classifyGradleFailure(err, stderr)
+	return class == "timeout" || class == "network" || class == "repository"
+}
+
+func containsAny(input string, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if strings.Contains(input, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseExitCode(errText string) int {
+	const prefix = "exit code "
+	idx := strings.Index(errText, prefix)
+	if idx < 0 {
+		return 0
+	}
+	raw := strings.TrimSpace(errText[idx+len(prefix):])
+	if raw == "" {
+		return 0
+	}
+	parts := strings.Fields(raw)
+	if len(parts) == 0 {
+		return 0
+	}
+	value, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0
+	}
+	return value
 }
 
 func parseResolvedVersionMap(output string) map[string]string {
