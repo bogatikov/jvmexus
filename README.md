@@ -4,12 +4,6 @@ JVMexus is a local-first MCP server and indexer for JVM repositories (Java/Kotli
 
 It provides project/module/dependency intelligence, symbol context, build graph output, and hybrid code retrieval for agent workflows.
 
-## Project Status
-
-- Current milestone: v1 (Phase 7 complete in code)
-- Primary scope: Gradle repositories with Java/Kotlin sources
-- Next planned scope: Maven support and deeper Kotlin semantics
-
 ## Features
 
 - Gradle module discovery from `settings.gradle(.kts)`
